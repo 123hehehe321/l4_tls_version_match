@@ -20,6 +20,7 @@ type TLSVersionMatch struct {
     Version string `json:"version,omitempty"`
 }
 
+// CaddyModule returns the module information.
 func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
     return caddy.ModuleInfo{
         ID:  "layer4.handlers.tls_version_match",
@@ -27,10 +28,11 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
     }
 }
 
+// Handle inspects the ClientHello to match TLS version.
 func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
     br := bufio.NewReader(conn.Conn)
 
-    // Peek TLS Record Header
+    // Peek TLS Record Header (5 bytes)
     header, err := br.Peek(5)
     if err != nil {
         return err
@@ -45,7 +47,7 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return errors.New("invalid TLS record length")
     }
 
-    // Peek Full TLS Record
+    // Peek Full TLS Record (5 + recordLength bytes)
     data, err := br.Peek(5 + int(recordLength))
     if err != nil {
         return err
@@ -63,15 +65,17 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return nil
     }
 
-    // Wrap the conn.Conn with buffered reader data
+    // Wrap conn.Conn with buffered reader to preserve Peeked data
     conn.Conn = &peekedConn{
         Conn:   conn.Conn,
         Reader: br,
     }
 
-    return nil // continue to next handler
+    // Continue to next handler in route
+    return conn.Next()
 }
 
+// peekedConn replays buffered data before reading from underlying Conn.
 type peekedConn struct {
     net.Conn
     Reader io.Reader
@@ -81,6 +85,7 @@ func (c *peekedConn) Read(b []byte) (int, error) {
     return c.Reader.Read(b)
 }
 
+// tlsVersionToString maps TLS version numbers to string.
 func tlsVersionToString(v uint16) string {
     switch v {
     case tls.VersionTLS13:
@@ -96,12 +101,5 @@ func tlsVersionToString(v uint16) string {
     }
 }
 
+// Interface compliance check
 var _ layer4.Handler = (*TLSVersionMatch)(nil)
-
-
-
-
-
-
-
-
