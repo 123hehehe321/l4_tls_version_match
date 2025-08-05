@@ -13,65 +13,58 @@ import (
 )
 
 func init() {
-    caddy.RegisterModule(TLSVersionMatch{})
+    caddy.RegisterModule(TLSVersionMatcher{})
 }
 
-type TLSVersionMatch struct {
+type TLSVersionMatcher struct {
     Version string `json:"version,omitempty"`
 }
 
-func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
+func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
     return caddy.ModuleInfo{
-        ID:  "layer4.handlers.tls_version_match",
-        New: func() caddy.Module { return new(TLSVersionMatch) },
+        ID:  "layer4.matchers.tls_version",
+        New: func() caddy.Module { return new(TLSVersionMatcher) },
     }
 }
 
-// 这里注意，Handle 方法签名要变成 (conn, next)
-func (h *TLSVersionMatch) Handle(conn *layer4.Connection, next layer4.Handler) error {
+func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
     br := bufio.NewReader(conn.Conn)
 
     // Peek TLS Record Header
     header, err := br.Peek(5)
     if err != nil {
-        return err
+        return false, err
     }
 
     if header[0] != 0x16 { // Handshake
-        return errors.New("not a TLS handshake record")
+        return false, errors.New("not a TLS handshake record")
     }
 
     recordLength := binary.BigEndian.Uint16(header[3:5])
     if recordLength < 4 {
-        return errors.New("invalid TLS record length")
+        return false, errors.New("invalid TLS record length")
     }
 
     // Peek Full TLS Record
     data, err := br.Peek(5 + int(recordLength))
     if err != nil {
-        return err
+        return false, err
     }
 
     if data[5] != 0x01 { // ClientHello
-        return errors.New("not a ClientHello message")
+        return false, errors.New("not a ClientHello message")
     }
 
     version := binary.BigEndian.Uint16(data[9:11])
     versionStr := tlsVersionToString(version)
 
-    if versionStr != h.Version {
-        conn.Conn.Close()
-        return nil // Reject non-matching version
-    }
-
-    // Wrap conn.Conn with buffered data
+    // Wrap back the buffered data
     conn.Conn = &peekedConn{
         Conn:   conn.Conn,
         Reader: br,
     }
 
-    // Pass to next handler
-    return next.Handle(conn)
+    return versionStr == m.Version, nil
 }
 
 type peekedConn struct {
@@ -98,5 +91,4 @@ func tlsVersionToString(v uint16) string {
     }
 }
 
-// 这里类型声明要改为 NextHandler
-var _ layer4.NextHandler = (*TLSVersionMatch)(nil)
+var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
