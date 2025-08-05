@@ -30,13 +30,12 @@ func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
 func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
     br := bufio.NewReader(conn.Conn)
 
-    // Peek TLS Record Header
     header, err := br.Peek(5)
     if err != nil {
         return false, err
     }
 
-    if header[0] != 0x16 { // Handshake
+    if header[0] != 0x16 {
         return false, errors.New("not a TLS handshake record")
     }
 
@@ -45,20 +44,19 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
         return false, errors.New("invalid TLS record length")
     }
 
-    // Peek Full TLS Record
     data, err := br.Peek(5 + int(recordLength))
     if err != nil {
         return false, err
     }
 
-    if data[5] != 0x01 { // ClientHello
+    if data[5] != 0x01 {
         return false, errors.New("not a ClientHello message")
     }
 
     version := binary.BigEndian.Uint16(data[9:11])
     versionStr := tlsVersionToString(version)
 
-    // Wrap back the buffered data
+    // Wrap back buffered data to conn
     conn.Conn = &peekedConn{
         Conn:   conn.Conn,
         Reader: br,
