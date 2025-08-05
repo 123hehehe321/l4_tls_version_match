@@ -1,6 +1,7 @@
 package tlsversionmatch
 
 import (
+    "bufio"
     "crypto/tls"
     "encoding/binary"
     "errors"
@@ -26,8 +27,10 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
 }
 
 func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
-    // 先 Peek 出前 5 个字节 (TLS record header)
-    recordHeader, err := conn.Peek(5)
+    br := bufio.NewReader(conn.Conn)
+
+    // Read TLS Record Header
+    recordHeader, err := br.Peek(5)
     if err != nil {
         return err
     }
@@ -41,14 +44,13 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return errors.New("invalid TLS record length")
     }
 
-    // Peek 完整的 ClientHello
-    helloBytes, err := conn.Peek(5 + int(recordLength))
+    // Peek Full ClientHello
+    helloBytes, err := br.Peek(5 + int(recordLength))
     if err != nil {
         return err
     }
 
-    handshakeType := helloBytes[5]
-    if handshakeType != 0x01 { // ClientHello
+    if helloBytes[5] != 0x01 { // ClientHello
         return errors.New("not a ClientHello message")
     }
 
@@ -57,12 +59,13 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
     versionStr := tlsVersionToString(version)
 
     if versionStr != h.Version {
-        conn.Close()
-        return nil // 不继续处理
+        conn.Conn.Close()
+        return nil
     }
 
-    // 继续后续 handler
-    return conn.Next()
+    // Replace the Reader so downstream handlers get full data
+    conn.Reader = io.MultiReader(br, conn.Conn)
+    return layer4.NextHandler(conn)
 }
 
 func tlsVersionToString(v uint16) string {
