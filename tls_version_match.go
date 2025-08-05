@@ -6,6 +6,7 @@ import (
     "encoding/binary"
     "errors"
     "io"
+    "net"
 
     "github.com/caddyserver/caddy/v2"
     "github.com/mholt/caddy-l4/layer4"
@@ -29,7 +30,7 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
 func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
     br := bufio.NewReader(conn.Conn)
 
-    // Peek TLS Record Header (5 bytes)
+    // Peek TLS Record Header
     header, err := br.Peek(5)
     if err != nil {
         return err
@@ -50,12 +51,10 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return err
     }
 
-    // ClientHello type check
-    if data[5] != 0x01 {
+    if data[5] != 0x01 { // ClientHello
         return errors.New("not a ClientHello message")
     }
 
-    // Extract TLS Version from ClientHello
     version := binary.BigEndian.Uint16(data[9:11])
     versionStr := tlsVersionToString(version)
 
@@ -64,18 +63,22 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return nil
     }
 
-    // Replace conn.Conn with a reader that replays the peeked data
-    conn.Conn = struct {
-        io.Reader
-        io.Writer
-        io.Closer
-    }{
-        Reader: io.MultiReader(br, conn.Conn),
-        Writer: conn.Conn,
-        Closer: conn.Conn,
+    // Wrap the conn.Conn with buffered reader data
+    conn.Conn = &peekedConn{
+        Conn:   conn.Conn,
+        Reader: br,
     }
 
-    return layer4.NextHandler(conn)
+    return nil // continue to next handler
+}
+
+type peekedConn struct {
+    net.Conn
+    Reader io.Reader
+}
+
+func (c *peekedConn) Read(b []byte) (int, error) {
+    return c.Reader.Read(b)
 }
 
 func tlsVersionToString(v uint16) string {
