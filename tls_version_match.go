@@ -29,33 +29,34 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
 func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
     br := bufio.NewReader(conn.Conn)
 
-    // Read TLS Record Header
-    recordHeader, err := br.Peek(5)
+    // Peek TLS Record Header (5 bytes)
+    header, err := br.Peek(5)
     if err != nil {
         return err
     }
 
-    if recordHeader[0] != 0x16 { // Handshake
+    if header[0] != 0x16 { // Handshake
         return errors.New("not a TLS handshake record")
     }
 
-    recordLength := binary.BigEndian.Uint16(recordHeader[3:5])
+    recordLength := binary.BigEndian.Uint16(header[3:5])
     if recordLength < 4 {
         return errors.New("invalid TLS record length")
     }
 
-    // Peek Full ClientHello
-    helloBytes, err := br.Peek(5 + int(recordLength))
+    // Peek Full TLS Record
+    data, err := br.Peek(5 + int(recordLength))
     if err != nil {
         return err
     }
 
-    if helloBytes[5] != 0x01 { // ClientHello
+    // ClientHello type check
+    if data[5] != 0x01 {
         return errors.New("not a ClientHello message")
     }
 
-    // TLS Version is in helloBytes[9:11]
-    version := binary.BigEndian.Uint16(helloBytes[9:11])
+    // Extract TLS Version from ClientHello
+    version := binary.BigEndian.Uint16(data[9:11])
     versionStr := tlsVersionToString(version)
 
     if versionStr != h.Version {
@@ -63,8 +64,17 @@ func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
         return nil
     }
 
-    // Replace the Reader so downstream handlers get full data
-    conn.Reader = io.MultiReader(br, conn.Conn)
+    // Replace conn.Conn with a reader that replays the peeked data
+    conn.Conn = struct {
+        io.Reader
+        io.Writer
+        io.Closer
+    }{
+        Reader: io.MultiReader(br, conn.Conn),
+        Writer: conn.Conn,
+        Closer: conn.Conn,
+    }
+
     return layer4.NextHandler(conn)
 }
 
@@ -84,5 +94,3 @@ func tlsVersionToString(v uint16) string {
 }
 
 var _ layer4.Handler = (*TLSVersionMatch)(nil)
-
-
