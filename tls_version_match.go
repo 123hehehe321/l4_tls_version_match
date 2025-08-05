@@ -1,12 +1,10 @@
 package tlsversionmatch
 
 import (
-    "context"
     "crypto/tls"
     "encoding/binary"
     "errors"
     "io"
-    "net"
 
     "github.com/caddyserver/caddy/v2"
     "github.com/mholt/caddy-l4/layer4"
@@ -27,51 +25,44 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
     }
 }
 
-// 这里必须符合 layer4.Handler 接口
 func (h TLSVersionMatch) Handle(conn *layer4.Connection) error {
-    // 读取 ClientHello，获得 TLS 版本
-    version, err := readClientHello(conn.RawConn())
+    // 先 Peek 出前 5 个字节 (TLS record header)
+    recordHeader, err := conn.Peek(5)
     if err != nil {
         return err
     }
 
-    versionStr := tlsVersionToString(version)
-    if versionStr != h.Version {
-        // 不匹配就直接断开
-        conn.Close()
-        return nil // 不再继续处理
-    }
-
-    // 匹配成功，继续下一个 handler
-    return layer4.NextHandler(conn)
-}
-
-func readClientHello(conn net.Conn) (uint16, error) {
-    var recordHeader [5]byte
-    if _, err := io.ReadFull(conn, recordHeader[:]); err != nil {
-        return 0, err
-    }
-
-    if recordHeader[0] != 0x16 { // handshake
-        return 0, errors.New("not a handshake record")
+    if recordHeader[0] != 0x16 { // Handshake
+        return errors.New("not a TLS handshake record")
     }
 
     recordLength := binary.BigEndian.Uint16(recordHeader[3:5])
     if recordLength < 4 {
-        return 0, errors.New("invalid record length")
+        return errors.New("invalid TLS record length")
     }
 
-    handshake := make([]byte, recordLength)
-    if _, err := io.ReadFull(conn, handshake); err != nil {
-        return 0, err
+    // Peek 完整的 ClientHello
+    helloBytes, err := conn.Peek(5 + int(recordLength))
+    if err != nil {
+        return err
     }
 
-    if handshake[0] != 0x01 { // client hello
-        return 0, errors.New("not a ClientHello")
+    handshakeType := helloBytes[5]
+    if handshakeType != 0x01 { // ClientHello
+        return errors.New("not a ClientHello message")
     }
 
-    version := binary.BigEndian.Uint16(handshake[4:6])
-    return version, nil
+    // TLS Version is in helloBytes[9:11]
+    version := binary.BigEndian.Uint16(helloBytes[9:11])
+    versionStr := tlsVersionToString(version)
+
+    if versionStr != h.Version {
+        conn.Close()
+        return nil // 不继续处理
+    }
+
+    // 继续后续 handler
+    return conn.Next()
 }
 
 func tlsVersionToString(v uint16) string {
@@ -89,5 +80,4 @@ func tlsVersionToString(v uint16) string {
     }
 }
 
-// 确保实现 layer4.Handler 接口
 var _ layer4.Handler = (*TLSVersionMatch)(nil)
