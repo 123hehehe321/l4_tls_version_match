@@ -17,8 +17,7 @@ func init() {
 }
 
 type TLSVersionMatch struct {
-    Version string          `json:"version,omitempty"`
-    Next    layer4.Handler  `json:"-"`
+    Version string `json:"version,omitempty"`
 }
 
 func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
@@ -28,8 +27,8 @@ func (TLSVersionMatch) CaddyModule() caddy.ModuleInfo {
     }
 }
 
-// 实现 NextHandler 接口的 Handle 方法
-func (h *TLSVersionMatch) Handle(conn *layer4.Connection) error {
+// 这里注意，Handle 方法签名要变成 (conn, next)
+func (h *TLSVersionMatch) Handle(conn *layer4.Connection, next layer4.Handler) error {
     br := bufio.NewReader(conn.Conn)
 
     // Peek TLS Record Header
@@ -62,24 +61,17 @@ func (h *TLSVersionMatch) Handle(conn *layer4.Connection) error {
 
     if versionStr != h.Version {
         conn.Conn.Close()
-        return nil // 断开连接，不往下走
+        return nil // Reject non-matching version
     }
 
-    // Wrap the conn.Conn with buffered reader data
+    // Wrap conn.Conn with buffered data
     conn.Conn = &peekedConn{
         Conn:   conn.Conn,
         Reader: br,
     }
 
-    if h.Next != nil {
-        return h.Next.Handle(conn)
-    }
-    return nil
-}
-
-// 实现 NextHandler 接口的 Next() 方法
-func (h *TLSVersionMatch) Next() layer4.Handler {
-    return h.Next
+    // Pass to next handler
+    return next.Handle(conn)
 }
 
 type peekedConn struct {
@@ -106,5 +98,5 @@ func tlsVersionToString(v uint16) string {
     }
 }
 
-// 声明实现 layer4.NextHandler 接口
+// 这里类型声明要改为 NextHandler
 var _ layer4.NextHandler = (*TLSVersionMatch)(nil)
