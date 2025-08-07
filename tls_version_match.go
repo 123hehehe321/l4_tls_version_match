@@ -19,10 +19,10 @@ func init() {
 }
 
 type TLSVersionMatcher struct {
-	Version         string          `json:"version,omitempty"`           // 目标 TLS 版本（例如 "1.3"）
-	IdleTimeout     caddy.Duration  `json:"idle_timeout,omitempty"`      // 初始握手超时
-	MaxIdleDuration caddy.Duration  `json:"max_idle_duration,omitempty"` // 匹配成功后最大空闲时长
-	MinBytesRead    int64           `json:"min_bytes_read,omitempty"`    // 最小总读取字节数
+	Version         string         `json:"version,omitempty"`           // 目标 TLS 版本（例如 "1.3"）
+	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始握手超时
+	MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"` // 匹配成功后最大空闲时长
+	MinBytesRead    int64          `json:"min_bytes_read,omitempty"`    // 最小总读取字节数
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -152,12 +152,18 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 }
 
 func (c *peekedConn) Close() error {
-	// 关闭监控 goroutine
 	c.mu.Lock()
-	if c.monitorClosed != nil {
-		close(c.monitorClosed)
+	defer c.mu.Unlock()
+
+	// 安全关闭 channel，避免 panic
+	select {
+	case <-c.monitorClosed:
+		// already closed
+	default:
+		if c.monitorClosed != nil {
+			close(c.monitorClosed)
+		}
 	}
-	c.mu.Unlock()
 
 	return c.Conn.Close()
 }
@@ -178,5 +184,4 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
-									
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
