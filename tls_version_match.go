@@ -80,7 +80,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	// 清除超时
 	_ = rawConn.SetReadDeadline(time.Time{})
 
-	// ✅ 启动周期性空闲检测（非阻塞）
+	// 新增部分 启动周期性空闲检测（非阻塞）
 	if m.CheckInterval > 0 {
 		go startIdleMonitor(rawConn, time.Duration(m.CheckInterval))
 	}
@@ -113,7 +113,7 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
-// ✅ 周期性空闲检测逻辑
+// 周期性空闲检测逻辑
 func startIdleMonitor(conn net.Conn, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
