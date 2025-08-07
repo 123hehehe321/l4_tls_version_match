@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -18,9 +19,10 @@ func init() {
 }
 
 type TLSVersionMatcher struct {
-	Version      string         `json:"version,omitempty"`       // 目标 TLS 版本（例如 "1.3"）
-	IdleTimeout  caddy.Duration `json:"idle_timeout,omitempty"`  // 初始读入时限
-	CheckInterval caddy.Duration `json:"check_interval,omitempty"` // 检查间隔时间，例：10s
+	Version         string          `json:"version,omitempty"`           // 目标 TLS 版本（例如 "1.3"）
+	IdleTimeout     caddy.Duration  `json:"idle_timeout,omitempty"`      // 初始握手超时
+	MaxIdleDuration caddy.Duration  `json:"max_idle_duration,omitempty"` // 匹配成功后最大空闲时长
+	MinBytesRead    int64           `json:"min_bytes_read,omitempty"`    // 最小总读取字节数
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -33,7 +35,7 @@ func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
 func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	rawConn := conn.Conn
 
-	// 设置初始读取超时
+	// 设置初始握手的读取超时
 	timeout := 3 * time.Second
 	if m.IdleTimeout != 0 {
 		timeout = time.Duration(m.IdleTimeout)
@@ -72,32 +74,95 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	versionStr := tlsVersionToString(version)
 
 	// 包装 conn，避免数据丢失
-	conn.Conn = &peekedConn{
+	pconn := &peekedConn{
 		Conn:   rawConn,
 		Reader: br,
 	}
 
-	// 清除超时
-	_ = rawConn.SetReadDeadline(time.Time{})
-
-	// 新增部分 启动周期性空闲检测（非阻塞）
-	if m.CheckInterval > 0 {
-		go startIdleMonitor(rawConn, time.Duration(m.CheckInterval))
+	// 启动最大空闲 & 最小数据监测
+	if m.MaxIdleDuration > 0 || m.MinBytesRead > 0 {
+		pconn.StartMonitor(time.Duration(m.MaxIdleDuration), m.MinBytesRead)
 	}
+
+	conn.Conn = pconn
+
+	// 清除读取超时
+	_ = rawConn.SetReadDeadline(time.Time{})
 
 	return versionStr == m.Version, nil
 }
 
-// peekedConn 保留 Peek 后的 Reader
+// ========== 包装连接 ==========
 type peekedConn struct {
 	net.Conn
-	Reader io.Reader
+	Reader        io.Reader
+	mu            sync.Mutex
+	totalBytes    int64
+	lastReadTime  time.Time
+	monitorOnce   sync.Once
+	monitorClosed chan struct{}
 }
 
 func (c *peekedConn) Read(b []byte) (int, error) {
-	return c.Reader.Read(b)
+	n, err := c.Reader.Read(b)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.totalBytes += int64(n)
+	c.lastReadTime = time.Now()
+	return n, err
 }
 
+// 启动监控协程
+func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
+	c.monitorOnce.Do(func() {
+		c.monitorClosed = make(chan struct{})
+
+		// 初始化最后读取时间
+		c.lastReadTime = time.Now()
+
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					c.mu.Lock()
+					idle := time.Since(c.lastReadTime)
+					total := c.totalBytes
+					c.mu.Unlock()
+
+					if maxIdle > 0 && idle > maxIdle {
+						c.Close()
+						return
+					}
+
+					if minBytes > 0 && total < minBytes && idle > maxIdle {
+						c.Close()
+						return
+					}
+
+				case <-c.monitorClosed:
+					return
+				}
+			}
+		}()
+	})
+}
+
+func (c *peekedConn) Close() error {
+	// 关闭监控 goroutine
+	c.mu.Lock()
+	if c.monitorClosed != nil {
+		close(c.monitorClosed)
+	}
+	c.mu.Unlock()
+
+	return c.Conn.Close()
+}
+
+// ========== TLS版本转字符串 ==========
 func tlsVersionToString(v uint16) string {
 	switch v {
 	case tls.VersionTLS13:
@@ -113,30 +178,5 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
-// 周期性空闲检测逻辑
-func startIdleMonitor(conn net.Conn, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	buffer := make([]byte, 1)
-
-	for range ticker.C {
-		_ = conn.SetReadDeadline(time.Now().Add(interval))
-
-		// 尝试读取 1 字节，如果超时说明连接空闲
-		_, err := conn.Read(buffer)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				_ = conn.Close()
-				return
-			}
-			// 其它错误，例如连接已关闭，也结束检测
-			return
-		}
-
-		// 有数据则继续下一轮
-	}
-}
-
-// 声明该类型为 layer4.Matcher
+									
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
