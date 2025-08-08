@@ -103,15 +103,29 @@ type peekedConn struct {
 	monitorClosed chan struct{}
 }
 
+
+
 func (c *peekedConn) Read(b []byte) (int, error) {
 	n, err := c.Reader.Read(b)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.totalBytes += int64(n)
-	c.lastReadTime = time.Now()
+	if n > 0 {
+		c.totalBytes += int64(n)
+		c.lastReadTime = time.Now()
+	}
+	if err != nil && c.monitorClosed != nil {
+		select {
+		case <-c.monitorClosed:
+		default:
+			close(c.monitorClosed)
+		}
+	}
 	return n, err
 }
+
+
+
 
 // 启动监控协程
 func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
