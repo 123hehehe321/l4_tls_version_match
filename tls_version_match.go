@@ -18,6 +18,7 @@ func init() {
 	caddy.RegisterModule(TLSVersionMatcher{})
 }
 
+// TLSVersionMatcher 用于匹配指定版本的 TLS 握手连接
 type TLSVersionMatcher struct {
 	Version         string         `json:"version,omitempty"`           // 目标 TLS 版本（例如 "1.3"）
 	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始握手超时
@@ -32,6 +33,7 @@ func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// Match 实现连接匹配逻辑
 func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	rawConn := conn.Conn
 
@@ -75,12 +77,14 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 
 	// 包装 conn，避免数据丢失
 	pconn := &peekedConn{
-		Conn:   rawConn,
-		Reader: br,
+		Conn:           rawConn,
+		Reader:         br,
+		monitorEnabled: false, // 默认不启用监控器
 	}
 
 	// 启动最大空闲 & 最小数据监测
 	if m.MaxIdleDuration > 0 || m.MinBytesRead > 0 {
+		pconn.monitorEnabled = true
 		pconn.StartMonitor(time.Duration(m.MaxIdleDuration), m.MinBytesRead)
 	}
 
@@ -95,26 +99,28 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 // ========== 包装连接 ==========
 type peekedConn struct {
 	net.Conn
-	Reader        io.Reader
-	mu            sync.Mutex
-	totalBytes    int64
-	lastReadTime  time.Time
-	monitorOnce   sync.Once
-	monitorClosed chan struct{}
+	Reader         io.Reader
+	mu             sync.Mutex
+	totalBytes     int64
+	lastReadTime   time.Time
+	monitorOnce    sync.Once
+	monitorClosed  chan struct{}
+	monitorEnabled bool // 是否启用了监控器
 }
 
-
-
+// Read 包装读取操作，记录总读取字节数和最后读取时间
 func (c *peekedConn) Read(b []byte) (int, error) {
 	n, err := c.Reader.Read(b)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if n > 0 {
 		c.totalBytes += int64(n)
 		c.lastReadTime = time.Now()
 	}
-	if err != nil && c.monitorClosed != nil {
+	// 如果启用了监控器，并且发生错误，则关闭监控协程
+	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
 		select {
 		case <-c.monitorClosed:
 		default:
@@ -123,9 +129,6 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 	}
 	return n, err
 }
-
-
-
 
 // 启动监控协程
 func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
@@ -165,16 +168,16 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 	})
 }
 
+// Close 安全关闭连接与监控器
 func (c *peekedConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// 安全关闭 channel，避免 panic
-	select {
-	case <-c.monitorClosed:
-		// already closed
-	default:
-		if c.monitorClosed != nil {
+	if c.monitorEnabled && c.monitorClosed != nil {
+		select {
+		case <-c.monitorClosed:
+		default:
 			close(c.monitorClosed)
 		}
 	}
@@ -198,4 +201,5 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
+// 接口实现保证
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
