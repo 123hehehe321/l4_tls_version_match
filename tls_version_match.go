@@ -44,7 +44,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	}
 	_ = rawConn.SetReadDeadline(time.Now().Add(timeout))
 
-	// 使用 bufio 包装读取器
+						 
 	br := bufio.NewReader(rawConn)
 
 	// 读取 TLS Record Header
@@ -72,8 +72,74 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		return false, errors.New("not a ClientHello message")
 	}
 
+	// 默认读取 client_version 字段 (bytes 9-10)
 	version := binary.BigEndian.Uint16(data[9:11])
 	versionStr := tlsVersionToString(version)
+
+	// 尝试解析 extensions，检查 supported_versions (0x002b)
+	// 跳过 ClientHello 固定字段
+	if len(data) < 44 {
+		return false, errors.New("ClientHello too short")
+	}
+	sessionIDL := int(data[43])
+	offset := 44 + sessionIDL
+
+	// cipher suites
+	if offset+2 > len(data) {
+		return false, errors.New("malformed ClientHello (cipher suites)")
+	}
+	cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2 + cipherLen
+
+	// compression methods
+	if offset >= len(data) {
+		return false, errors.New("malformed ClientHello (compression)")
+	}
+	compLen := int(data[offset])
+	offset += 1 + compLen
+
+	// extensions length
+	if offset+2 > len(data) {
+		return false, errors.New("malformed ClientHello (extensions length)")
+	}
+	extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+
+	if offset+extLen > len(data) {
+		return false, errors.New("malformed ClientHello (extensions)")
+	}
+
+	// 遍历 extensions
+	for extOff := offset; extOff+4 <= offset+extLen; {
+		extType := binary.BigEndian.Uint16(data[extOff : extOff+2])
+		extSize := int(binary.BigEndian.Uint16(data[extOff+2 : extOff+4]))
+		extDataStart := extOff + 4
+		extDataEnd := extDataStart + extSize
+
+		if extDataEnd > offset+extLen {
+			break
+		}
+
+		// supported_versions (0x002b)
+		if extType == 0x002b {
+			if extSize < 3 {
+				break
+			}
+			listLen := int(data[extDataStart])
+			if extDataStart+1+listLen > extDataEnd {
+				break
+			}
+			// 遍历 supported_versions 列表
+			for i := extDataStart + 1; i < extDataStart+1+listLen; i += 2 {
+				sver := binary.BigEndian.Uint16(data[i : i+2])
+				if sver == tls.VersionTLS13 {
+					versionStr = "1.3"
+				}
+			}
+		}
+
+		extOff = extDataEnd
+	}
 
 	// 包装 conn，避免数据丢失
 	pconn := &peekedConn{
@@ -134,8 +200,8 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 	c.monitorOnce.Do(func() {
 		c.monitorClosed = make(chan struct{})
-
 		// 初始化最后读取时间
+					   
 		c.lastReadTime = time.Now()
 
 		go func() {
@@ -168,7 +234,7 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 	})
 }
 
-// Close 安全关闭连接与监控器
+// Close 安全关闭连接与监控器							 
 func (c *peekedConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
