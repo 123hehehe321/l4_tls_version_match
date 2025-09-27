@@ -258,7 +258,3 @@ func tlsVersionToString(v uint16) string {
 
 // 接口实现保证
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
-
-
-
-检查代码是否有问题？
