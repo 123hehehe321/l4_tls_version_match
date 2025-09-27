@@ -68,11 +68,12 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		return false, nil
 	}
 
-	// 读取完整 ClientHello
-	data, err := br.Peek(5 + recordLen)
-	if err != nil {
+	// Peek 足够多的 ClientHello 数据，保证 TLS1.3 支持
+	data, err := br.Peek(5 + recordLen + 1024) // 多加1KB扩展空间
+	if err != nil && err != io.EOF {
 		return false, err
 	}
+
 	version := parseClientHelloTLS12or13(data)
 	if version == "" || version != m.Version {
 		return false, nil
@@ -147,19 +148,18 @@ func parseClientHelloTLS12or13(data []byte) string {
 			break
 		}
 
-		if extType == 0x002b && extSize >= 2 { // supported_versions 扩展
-			if extDataStart+1 >= len(data) {
+		// TLS 1.3 supported_versions 扩展
+		if extType == 0x002b && extSize >= 2 {
+			extData := data[extDataStart:extDataEnd]
+			if len(extData) < 3 {
 				break
 			}
-			listLen := int(data[extDataStart])
-			if extDataStart+1+listLen > len(data) {
-				break
-			}
+			listLen := int(extData[0])
 			for i := 0; i < listLen; i += 2 {
-				if extDataStart+1+i+2 > len(data) {
+				if 1+i+2 > len(extData) {
 					break
 				}
-				v := binary.BigEndian.Uint16(data[extDataStart+1+i : extDataStart+1+i+2])
+				v := binary.BigEndian.Uint16(extData[1+i : 1+i+2])
 				if v == tls.VersionTLS12 {
 					return TLSVersion12
 				}
@@ -168,8 +168,19 @@ func parseClientHelloTLS12or13(data []byte) string {
 				}
 			}
 		}
+
 		extOff = extDataEnd
 	}
+
+	// fallback legacy_version (兼容 TLS1.2/1.3)
+	version := binary.BigEndian.Uint16(data[9:11])
+	if version == tls.VersionTLS12 {
+		return TLSVersion12
+	}
+	if version == tls.VersionTLS13 {
+		return TLSVersion13
+	}
+
 	return ""
 }
 
@@ -252,18 +263,14 @@ type timeoutConn struct {
 
 func (c *timeoutConn) Read(b []byte) (int, error) {
 	if c.idleTimeout > 0 {
-		if err := c.Conn.SetReadDeadline(time.Now().Add(c.idleTimeout)); err != nil {
-			fmt.Println("SetReadDeadline error:", err)
-		}
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idleTimeout))
 	}
 	return c.Conn.Read(b)
 }
 
 func (c *timeoutConn) Write(b []byte) (int, error) {
 	if c.idleTimeout > 0 {
-		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.idleTimeout)); err != nil {
-			fmt.Println("SetWriteDeadline error:", err)
-		}
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idleTimeout))
 	}
 	return c.Conn.Write(b)
 }
@@ -288,4 +295,3 @@ func asyncLogger(path string, logChan <-chan string) {
 
 // ========================= 接口实现 =========================
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
-
