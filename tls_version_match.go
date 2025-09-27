@@ -2,6 +2,7 @@ package tlsversionmatch
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -28,6 +29,8 @@ type TLSVersionMatcher struct {
 	LogFile         string         `json:"log_file,omitempty"`          // 日志文件路径
 	EnableLog       bool           `json:"enable_log,omitempty"`        // 是否启用日志记录
 	logMu           sync.Mutex
+	logChan         chan string
+	logOnce         sync.Once
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -73,13 +76,19 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	// 解析 ClientHello 支持的版本
 	supportedVersions := parseClientHelloSupportedVersions(data)
 
-	// 匹配用户指定版本
-	matched := false
+	// 用 map 加速匹配
+	versionSet := make(map[string]struct{}, len(supportedVersions))
 	for _, v := range supportedVersions {
-		if v == m.Version {
-			matched = true
-			break
-		}
+		versionSet[v] = struct{}{}
+	}
+	_, matched := versionSet[m.Version]
+
+	// 初始化日志 channel
+	if m.EnableLog && m.LogFile != "" {
+		m.logOnce.Do(func() {
+			m.logChan = make(chan string, 1024)
+			go asyncLogger(m.LogFile, m.logChan)
+		})
 	}
 
 	// 包装 peekedConn 监控滑动窗口
@@ -87,9 +96,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		Conn:           pconn,
 		Reader:         br,
 		monitorEnabled: false,
-		logFile:        m.LogFile,
-		enableLog:      m.EnableLog,
-		logMu:          &m.logMu,
+		logChan:        m.logChan,
 	}
 
 	if m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
@@ -101,14 +108,18 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	return matched, nil
 }
 
-// parseClientHelloSupportedVersions 安全解析 ClientHello 返回 supported_versions 列表
+// ========================= ClientHello 解析 =========================
 func parseClientHelloSupportedVersions(data []byte) []string {
 	var versions []string
 	if len(data) < 44 {
 		return versions
 	}
 
-	offset := 5 + 1 + 2 + 32 // HandshakeType + Length(3) + Version(2) + Random(32)
+	offset := 5 + 1 + 2 + 32
+	if offset >= len(data) {
+		return versions
+	}
+
 	sessionIDLen := int(data[offset])
 	offset += 1 + sessionIDLen
 	if offset+2 > len(data) {
@@ -143,9 +154,9 @@ func parseClientHelloSupportedVersions(data []byte) []string {
 			break
 		}
 
-		if extType == 0x002b && extSize >= 2 { // supported_versions
+		if extType == 0x002b && extSize >= 2 {
 			listLen := int(data[extDataStart])
-			if extDataStart+1+listLen <= extDataEnd {
+			if listLen%2 == 0 && extDataStart+1+listLen <= extDataEnd {
 				for i := 0; i < listLen; i += 2 {
 					v := binary.BigEndian.Uint16(data[extDataStart+1+i : extDataStart+1+i+2])
 					versions = append(versions, tlsVersionToString(v))
@@ -165,18 +176,16 @@ func parseClientHelloSupportedVersions(data []byte) []string {
 	return versions
 }
 
-// ================= peekedConn 包装连接，用于监控数据传输 =================
+// ========================= peekedConn =========================
 type peekedConn struct {
 	net.Conn
 	Reader         io.Reader
 	mu             sync.Mutex
 	totalBytes     int64
 	monitorOnce    sync.Once
-	monitorClosed  chan struct{}
+	monitorCancel  context.CancelFunc
 	monitorEnabled bool
-	logFile        string
-	enableLog      bool
-	logMu          *sync.Mutex
+	logChan        chan string
 }
 
 func (c *peekedConn) Read(b []byte) (int, error) {
@@ -186,14 +195,22 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 		c.totalBytes += int64(n)
 		c.mu.Unlock()
 	}
-	if err != nil && c.monitorEnabled && c.monitorClosed != nil {
-		select {
-		case <-c.monitorClosed:
-		default:
-			close(c.monitorClosed)
-		}
+	if err != nil {
+		c.stopMonitor()
 	}
 	return n, err
+}
+
+func (c *peekedConn) Close() error {
+	c.stopMonitor()
+	return c.Conn.Close()
+}
+
+func (c *peekedConn) stopMonitor() {
+	if c.monitorEnabled && c.monitorCancel != nil {
+		c.monitorCancel()
+		c.monitorCancel = nil
+	}
 }
 
 func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
@@ -201,7 +218,8 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 		if window <= 0 || minBytes <= 0 {
 			return
 		}
-		c.monitorClosed = make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		c.monitorCancel = cancel
 		var lastTotal int64
 
 		go func() {
@@ -216,15 +234,13 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 					c.mu.Unlock()
 
 					if delta < minBytes {
-						if c.enableLog && c.logFile != "" && c.logMu != nil {
-							c.logMu.Lock()
-							appendLog(c.logFile, c.Conn.RemoteAddr().String()+"\n")
-							c.logMu.Unlock()
+						if c.logChan != nil {
+							c.logChan <- time.Now().Format(time.RFC3339) + " " + c.Conn.RemoteAddr().String()
 						}
 						_ = c.Close()
 						return
 					}
-				case <-c.monitorClosed:
+				case <-ctx.Done():
 					return
 				}
 			}
@@ -232,20 +248,7 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 	})
 }
 
-func (c *peekedConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.monitorEnabled && c.monitorClosed != nil {
-		select {
-		case <-c.monitorClosed:
-		default:
-			close(c.monitorClosed)
-		}
-	}
-	return c.Conn.Close()
-}
-
-// ================= timeoutConn 保证 IdleTimeout 全程生效 =================
+// ========================= timeoutConn =========================
 type timeoutConn struct {
 	net.Conn
 	idleTimeout time.Duration
@@ -265,17 +268,19 @@ func (c *timeoutConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// appendLog 追加日志（高并发安全）
-func appendLog(path, msg string) {
+// ========================= 异步日志 =========================
+func asyncLogger(path string, logChan <-chan string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	_, _ = f.WriteString(msg)
+	for msg := range logChan {
+		_, _ = f.WriteString(msg + "\n")
+	}
 }
 
-// tlsVersionToString 转换 TLS 版本号
+// ========================= TLS 版本转换 =========================
 func tlsVersionToString(v uint16) string {
 	switch v {
 	case tls.VersionTLS13:
@@ -291,6 +296,7 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
-// 确保实现 layer4.ConnMatcher 接口
+// ========================= 接口实现 =========================
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
+
 
