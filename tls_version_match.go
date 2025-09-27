@@ -70,12 +70,19 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		return false, errors.New("not a ClientHello message or too short")
 	}
 
-	// 解析 ClientHello，检查是否包含目标 TLS 版本
-	var versionStr string
-	if contains := parseSupportedVersionsContains(data, m.Version); contains {
-		versionStr = m.Version
-	} else {
-		// fallback 读取 legacy_version
+	// 解析 ClientHello 支持的版本
+	supportedVersions := parseClientHelloSupportedVersions(data)
+	versionStr := ""
+	for _, v := range supportedVersions {
+		if v == m.Version {
+			versionStr = v
+			break
+		}
+	}
+	if versionStr == "" && len(supportedVersions) > 0 {
+		versionStr = supportedVersions[0] // fallback 使用最高版本
+	} else if versionStr == "" {
+		// fallback legacy_version
 		version := binary.BigEndian.Uint16(data[9:11])
 		versionStr = tlsVersionToString(version)
 	}
@@ -99,34 +106,37 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	return versionStr == m.Version, nil
 }
 
-// parseSupportedVersionsContains 返回 ClientHello supported_versions 扩展是否包含目标版本
-func parseSupportedVersionsContains(data []byte, target string) bool {
+// parseClientHelloSupportedVersions 安全解析 ClientHello 返回 supported_versions 列表
+func parseClientHelloSupportedVersions(data []byte) []string {
+	var versions []string
 	if len(data) < 44 {
-		return false
+		return versions
 	}
-	sessionIDLen := int(data[43])
-	offset := 44 + sessionIDLen
+
+	offset := 5 + 1 + 2 + 32 // HandshakeType + Length(3) + Version(2) + Random(32)
+	sessionIDLen := int(data[offset])
+	offset += 1 + sessionIDLen
 	if offset+2 > len(data) {
-		return false
+		return versions
 	}
 
 	cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2 + cipherLen
 	if offset >= len(data) {
-		return false
+		return versions
 	}
 
 	compLen := int(data[offset])
 	offset += 1 + compLen
 	if offset+2 > len(data) {
-		return false
+		return versions
 	}
 
 	extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 	extEnd := offset + extLen
 	if extEnd > len(data) {
-		return false
+		return versions
 	}
 
 	for extOff := offset; extOff+4 <= extEnd; {
@@ -141,16 +151,19 @@ func parseSupportedVersionsContains(data []byte, target string) bool {
 		if extType == 0x002b && extSize >= 3 { // supported_versions
 			listLen := int(data[extDataStart])
 			for i := extDataStart + 1; i+1 < extDataEnd && i < extDataStart+1+listLen; i += 2 {
-				v := tlsVersionToString(binary.BigEndian.Uint16(data[i : i+2]))
-				if v == target {
-					return true
-				}
+				versions = append(versions, tlsVersionToString(binary.BigEndian.Uint16(data[i:i+2])))
 			}
 		}
-
 		extOff = extDataEnd
 	}
-	return false
+
+	// 如果没有 supported_versions 扩展，则 fallback legacy_version
+	if len(versions) == 0 && len(data) >= 11 {
+		version := binary.BigEndian.Uint16(data[9:11])
+		versions = append(versions, tlsVersionToString(version))
+	}
+
+	return versions
 }
 
 // ================= peekedConn 包装连接，用于监控数据传输 =================
@@ -174,8 +187,7 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 		c.totalBytes += int64(n)
 		c.mu.Unlock()
 	}
-
-	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
+	if err != nil && c.monitorEnabled && c.monitorClosed != nil {
 		select {
 		case <-c.monitorClosed:
 		default:
@@ -210,7 +222,7 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 							appendLog(c.logFile, c.Conn.RemoteAddr().String()+"\n")
 							c.logMu.Unlock()
 						}
-						c.Close()
+						_ = c.Close()
 						return
 					}
 				case <-c.monitorClosed:
@@ -254,7 +266,7 @@ func (c *timeoutConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// appendLog 追加日志（简单安全写入）
+// appendLog 追加日志（高并发安全）
 func appendLog(path, msg string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
