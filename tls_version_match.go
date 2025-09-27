@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ type TLSVersionMatcher struct {
 	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始握手超时
 	MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"` // 匹配成功后最大空闲时长
 	MinBytesRead    int64          `json:"min_bytes_read,omitempty"`    // 最小总读取字节数
+	LogFile         string         `json:"log_file,omitempty"`          // 日志文件路径
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -44,7 +46,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	}
 	_ = rawConn.SetReadDeadline(time.Now().Add(timeout))
 
-						 
+	   
 	br := bufio.NewReader(rawConn)
 
 	// 读取 TLS Record Header
@@ -77,7 +79,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	versionStr := tlsVersionToString(version)
 
 	// 尝试解析 extensions，检查 supported_versions (0x002b)
-	// 跳过 ClientHello 固定字段
+								   
 	if len(data) < 44 {
 		return false, errors.New("ClientHello too short")
 	}
@@ -145,7 +147,8 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	pconn := &peekedConn{
 		Conn:           rawConn,
 		Reader:         br,
-		monitorEnabled: false, // 默认不启用监控器
+		monitorEnabled: false,
+		logFile:        m.LogFile,
 	}
 
 	// 启动最大空闲 & 最小数据监测
@@ -171,7 +174,8 @@ type peekedConn struct {
 	lastReadTime   time.Time
 	monitorOnce    sync.Once
 	monitorClosed  chan struct{}
-	monitorEnabled bool // 是否启用了监控器
+	monitorEnabled bool
+	logFile        string
 }
 
 // Read 包装读取操作，记录总读取字节数和最后读取时间
@@ -201,7 +205,7 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 	c.monitorOnce.Do(func() {
 		c.monitorClosed = make(chan struct{})
 		// 初始化最后读取时间
-					   
+		
 		c.lastReadTime = time.Now()
 
 		go func() {
@@ -222,6 +226,12 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 					}
 
 					if minBytes > 0 && total < minBytes && idle > maxIdle {
+						// 写日志
+						if c.logFile != "" {
+							remoteAddr := c.Conn.RemoteAddr().String()
+							msg := time.Now().Format(time.RFC3339) + " - closed due to MinBytesRead not met: " + remoteAddr + "\n"
+							go appendLog(c.logFile, msg)
+						}
 						c.Close()
 						return
 					}
@@ -234,7 +244,7 @@ func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
 	})
 }
 
-// Close 安全关闭连接与监控器							 
+// Close 安全关闭连接与监控器
 func (c *peekedConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -249,6 +259,16 @@ func (c *peekedConn) Close() error {
 	}
 
 	return c.Conn.Close()
+}
+
+// 追加日志
+func appendLog(path, msg string) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(msg)
 }
 
 // ========== TLS版本转字符串 ==========
@@ -268,4 +288,4 @@ func tlsVersionToString(v uint16) string {
 }
 
 // 接口实现保证
-var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
+var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)																																									 
