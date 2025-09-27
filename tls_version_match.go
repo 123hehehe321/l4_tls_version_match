@@ -23,8 +23,8 @@ func init() {
 type TLSVersionMatcher struct {
 	Version         string         `json:"version,omitempty"`           // 目标 TLS 版本（例如 "1.3"）
 	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始握手超时
-	MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"` // 匹配成功后最大空闲时长
-	MinBytesRead    int64          `json:"min_bytes_read,omitempty"`    // 最小总读取字节数
+	MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"` // 滑动窗口检测时间
+	MinBytesRead    int64          `json:"min_bytes_read,omitempty"`    // 窗口内最小总读取字节数
 	LogFile         string         `json:"log_file,omitempty"`          // 日志文件路径
 	EnableLog       bool           `json:"enable_log,omitempty"`        // 是否启用日志
 }
@@ -47,7 +47,6 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	}
 	_ = rawConn.SetReadDeadline(time.Now().Add(timeout))
 
-	   
 	br := bufio.NewReader(rawConn)
 
 	// 读取 TLS Record Header
@@ -80,68 +79,43 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	versionStr := tlsVersionToString(version)
 
 	// 尝试解析 extensions，检查 supported_versions (0x002b)
-								   
-	if len(data) < 44 {
-		return false, errors.New("ClientHello too short")
-	}
-	sessionIDL := int(data[43])
-	offset := 44 + sessionIDL
+	if len(data) >= 44 {
+		sessionIDL := int(data[43])
+		offset := 44 + sessionIDL
 
-	// cipher suites
-	if offset+2 > len(data) {
-		return false, errors.New("malformed ClientHello (cipher suites)")
-	}
-	cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2 + cipherLen
+		if offset+2 <= len(data) {
+			cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2 + cipherLen
 
-	// compression methods
-	if offset >= len(data) {
-		return false, errors.New("malformed ClientHello (compression)")
-	}
-	compLen := int(data[offset])
-	offset += 1 + compLen
+			if offset < len(data) {
+				compLen := int(data[offset])
+				offset += 1 + compLen
 
-	// extensions length
-	if offset+2 > len(data) {
-		return false, errors.New("malformed ClientHello (extensions length)")
-	}
-	extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-
-	if offset+extLen > len(data) {
-		return false, errors.New("malformed ClientHello (extensions)")
-	}
-
-	// 遍历 extensions
-	for extOff := offset; extOff+4 <= offset+extLen; {
-		extType := binary.BigEndian.Uint16(data[extOff : extOff+2])
-		extSize := int(binary.BigEndian.Uint16(data[extOff+2 : extOff+4]))
-		extDataStart := extOff + 4
-		extDataEnd := extDataStart + extSize
-
-		if extDataEnd > offset+extLen {
-			break
-		}
-
-		// supported_versions (0x002b)
-		if extType == 0x002b {
-			if extSize < 3 {
-				break
-			}
-			listLen := int(data[extDataStart])
-			if extDataStart+1+listLen > extDataEnd {
-				break
-			}
-			// 遍历 supported_versions 列表
-			for i := extDataStart + 1; i < extDataStart+1+listLen; i += 2 {
-				sver := binary.BigEndian.Uint16(data[i : i+2])
-				if sver == tls.VersionTLS13 {
-					versionStr = "1.3"
+				if offset+2 <= len(data) {
+					extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+					offset += 2
+					for extOff := offset; extOff+4 <= offset+extLen; {
+						extType := binary.BigEndian.Uint16(data[extOff : extOff+2])
+						extSize := int(binary.BigEndian.Uint16(data[extOff+2 : extOff+4]))
+						extDataStart := extOff + 4
+						extDataEnd := extDataStart + extSize
+						if extDataEnd > offset+extLen {
+							break
+						}
+						if extType == 0x002b && extSize >= 3 {
+							listLen := int(data[extDataStart])
+							for i := extDataStart + 1; i < extDataStart+1+listLen; i += 2 {
+								sver := binary.BigEndian.Uint16(data[i : i+2])
+								if sver == tls.VersionTLS13 {
+									versionStr = "1.3"
+								}
+							}
+						}
+						extOff = extDataEnd
+					}
 				}
 			}
 		}
-
-		extOff = extDataEnd
 	}
 
 	// 包装 conn，避免数据丢失
@@ -153,8 +127,8 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		enableLog:      m.EnableLog,
 	}
 
-	// 启动最大空闲 & 最小数据监测
-	if m.MaxIdleDuration > 0 || m.MinBytesRead > 0 {
+	// 启动滑动窗口监控
+	if m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
 		pconn.monitorEnabled = true
 		pconn.StartMonitor(time.Duration(m.MaxIdleDuration), m.MinBytesRead)
 	}
@@ -173,7 +147,6 @@ type peekedConn struct {
 	Reader         io.Reader
 	mu             sync.Mutex
 	totalBytes     int64
-	lastReadTime   time.Time
 	monitorOnce    sync.Once
 	monitorClosed  chan struct{}
 	monitorEnabled bool
@@ -181,17 +154,16 @@ type peekedConn struct {
 	enableLog      bool
 }
 
-// Read 包装读取操作，记录总读取字节数和最后读取时间
+// Read 包装读取操作，记录总读取字节数
 func (c *peekedConn) Read(b []byte) (int, error) {
 	n, err := c.Reader.Read(b)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if n > 0 {
 		c.totalBytes += int64(n)
-		c.lastReadTime = time.Now()
 	}
+	c.mu.Unlock()
+
 	// 如果启用了监控器，并且发生错误，则关闭监控协程
 	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
 		select {
@@ -203,32 +175,28 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// 启动监控协程
-func (c *peekedConn) StartMonitor(maxIdle time.Duration, minBytes int64) {
+// StartMonitor 每窗口检测总读取字节数
+func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 	c.monitorOnce.Do(func() {
+		if window <= 0 || minBytes <= 0 {
+			return
+		}
 		c.monitorClosed = make(chan struct{})
-		// 初始化最后读取时间
-		
-		c.lastReadTime = time.Now()
+		var lastTotal int64
 
 		go func() {
-			ticker := time.NewTicker(10 * time.Second)
+			ticker := time.NewTicker(window)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-ticker.C:
 					c.mu.Lock()
-					idle := time.Since(c.lastReadTime)
-					total := c.totalBytes
+					delta := c.totalBytes - lastTotal
+					lastTotal = c.totalBytes
 					c.mu.Unlock()
 
-					if maxIdle > 0 && idle > maxIdle {
-						c.Close()
-						return
-					}
-
-					if minBytes > 0 && total < minBytes && idle > maxIdle {
+					if delta < minBytes {
 						// 写日志（仅 IP:端口）
 						if c.enableLog && c.logFile != "" {
 							remoteAddr := c.Conn.RemoteAddr().String()
@@ -251,7 +219,6 @@ func (c *peekedConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 安全关闭 channel，避免 panic
 	if c.monitorEnabled && c.monitorClosed != nil {
 		select {
 		case <-c.monitorClosed:
@@ -290,4 +257,8 @@ func tlsVersionToString(v uint16) string {
 }
 
 // 接口实现保证
-var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)																																															 
+var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
+
+
+
+检查代码是否有问题？
