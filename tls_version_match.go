@@ -72,19 +72,14 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 
 	// 解析 ClientHello 支持的版本
 	supportedVersions := parseClientHelloSupportedVersions(data)
-	versionStr := ""
+
+	// 匹配用户指定版本
+	matched := false
 	for _, v := range supportedVersions {
 		if v == m.Version {
-			versionStr = v
+			matched = true
 			break
 		}
-	}
-	if versionStr == "" && len(supportedVersions) > 0 {
-		versionStr = supportedVersions[0] // fallback 使用最高版本
-	} else if versionStr == "" {
-		// fallback legacy_version
-		version := binary.BigEndian.Uint16(data[9:11])
-		versionStr = tlsVersionToString(version)
 	}
 
 	// 包装 peekedConn 监控滑动窗口
@@ -103,7 +98,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	}
 
 	conn.Conn = monitorConn
-	return versionStr == m.Version, nil
+	return matched, nil
 }
 
 // parseClientHelloSupportedVersions 安全解析 ClientHello 返回 supported_versions 列表
@@ -148,16 +143,20 @@ func parseClientHelloSupportedVersions(data []byte) []string {
 			break
 		}
 
-		if extType == 0x002b && extSize >= 3 { // supported_versions
+		if extType == 0x002b && extSize >= 2 { // supported_versions
 			listLen := int(data[extDataStart])
-			for i := extDataStart + 1; i+1 < extDataEnd && i < extDataStart+1+listLen; i += 2 {
-				versions = append(versions, tlsVersionToString(binary.BigEndian.Uint16(data[i:i+2])))
+			if extDataStart+1+listLen <= extDataEnd {
+				for i := 0; i < listLen; i += 2 {
+					v := binary.BigEndian.Uint16(data[extDataStart+1+i : extDataStart+1+i+2])
+					versions = append(versions, tlsVersionToString(v))
+				}
 			}
 		}
+
 		extOff = extDataEnd
 	}
 
-	// 如果没有 supported_versions 扩展，则 fallback legacy_version
+	// fallback legacy_version
 	if len(versions) == 0 && len(data) >= 11 {
 		version := binary.BigEndian.Uint16(data[9:11])
 		versions = append(versions, tlsVersionToString(version))
@@ -261,7 +260,7 @@ func (c *timeoutConn) Read(b []byte) (int, error) {
 
 func (c *timeoutConn) Write(b []byte) (int, error) {
 	if c.idleTimeout > 0 {
-		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idleTimeout))
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idleTimeout))
 	}
 	return c.Conn.Write(b)
 }
@@ -294,6 +293,4 @@ func tlsVersionToString(v uint16) string {
 
 // 确保实现 layer4.ConnMatcher 接口
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
-
-
 
