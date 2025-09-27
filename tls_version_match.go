@@ -16,21 +16,20 @@ import (
 )
 
 func init() {
-	// 注册模块到 Caddy
 	caddy.RegisterModule(TLSVersionMatcher{})
 }
 
 // TLSVersionMatcher 匹配指定 TLS 版本
 type TLSVersionMatcher struct {
 	Version         string         `json:"version,omitempty"`           // 目标 TLS 版本，例如 "1.3"
-	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始 TLS 握手超时时间，由配置文件控制
+	IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`      // 初始 TLS 握手超时时间
 	MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"` // 滑动窗口监控时间
 	MinBytesRead    int64          `json:"min_bytes_read,omitempty"`    // 滑动窗口内最小读取字节数
 	LogFile         string         `json:"log_file,omitempty"`          // 日志文件路径
 	EnableLog       bool           `json:"enable_log,omitempty"`        // 是否启用日志记录
+	logMu           sync.Mutex
 }
 
-// CaddyModule 返回模块信息，用于 Caddy 注册
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "layer4.matchers.tls_version",
@@ -42,7 +41,6 @@ func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
 func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	rawConn := conn.Conn
 
-	// 包装原始连接，使 IdleTimeout 全程生效
 	pconn := &timeoutConn{
 		Conn:        rawConn,
 		idleTimeout: time.Duration(m.IdleTimeout),
@@ -55,8 +53,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
-	if header[0] != 0x16 { // TLS handshake
+	if header[0] != 0x16 {
 		return false, errors.New("not a TLS handshake record")
 	}
 
@@ -69,18 +66,18 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
 	if len(data) < 11 || data[5] != 0x01 { // ClientHello
 		return false, errors.New("not a ClientHello message or too short")
 	}
 
-	// 默认读取 client_version
-	version := binary.BigEndian.Uint16(data[9:11])
-	versionStr := tlsVersionToString(version)
-
-	// 尝试解析 supported_versions 扩展
-	if extVersion := parseSupportedVersions(data, m.Version); extVersion != "" {
-		versionStr = extVersion
+	// 解析 ClientHello，检查是否包含目标 TLS 版本
+	var versionStr string
+	if contains := parseSupportedVersionsContains(data, m.Version); contains {
+		versionStr = m.Version
+	} else {
+		// fallback 读取 legacy_version
+		version := binary.BigEndian.Uint16(data[9:11])
+		versionStr = tlsVersionToString(version)
 	}
 
 	// 包装 peekedConn 监控滑动窗口
@@ -90,6 +87,7 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		monitorEnabled: false,
 		logFile:        m.LogFile,
 		enableLog:      m.EnableLog,
+		logMu:          &m.logMu,
 	}
 
 	if m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
@@ -101,34 +99,34 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	return versionStr == m.Version, nil
 }
 
-// parseSupportedVersions 解析 ClientHello 的 supported_versions 扩展
-func parseSupportedVersions(data []byte, targetVersion string) string {
+// parseSupportedVersionsContains 返回 ClientHello supported_versions 扩展是否包含目标版本
+func parseSupportedVersionsContains(data []byte, target string) bool {
 	if len(data) < 44 {
-		return ""
+		return false
 	}
-	sessionIDL := int(data[43])
-	offset := 44 + sessionIDL
+	sessionIDLen := int(data[43])
+	offset := 44 + sessionIDLen
 	if offset+2 > len(data) {
-		return ""
+		return false
 	}
 
 	cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2 + cipherLen
 	if offset >= len(data) {
-		return ""
+		return false
 	}
 
 	compLen := int(data[offset])
 	offset += 1 + compLen
 	if offset+2 > len(data) {
-		return ""
+		return false
 	}
 
 	extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 	extEnd := offset + extLen
 	if extEnd > len(data) {
-		return ""
+		return false
 	}
 
 	for extOff := offset; extOff+4 <= extEnd; {
@@ -143,17 +141,16 @@ func parseSupportedVersions(data []byte, targetVersion string) string {
 		if extType == 0x002b && extSize >= 3 { // supported_versions
 			listLen := int(data[extDataStart])
 			for i := extDataStart + 1; i+1 < extDataEnd && i < extDataStart+1+listLen; i += 2 {
-				v := binary.BigEndian.Uint16(data[i : i+2])
-				vStr := tlsVersionToString(v)
-				if vStr == targetVersion {
-					return vStr
+				v := tlsVersionToString(binary.BigEndian.Uint16(data[i : i+2]))
+				if v == target {
+					return true
 				}
 			}
 		}
 
 		extOff = extDataEnd
 	}
-	return ""
+	return false
 }
 
 // ================= peekedConn 包装连接，用于监控数据传输 =================
@@ -167,15 +164,16 @@ type peekedConn struct {
 	monitorEnabled bool
 	logFile        string
 	enableLog      bool
+	logMu          *sync.Mutex
 }
 
 func (c *peekedConn) Read(b []byte) (int, error) {
 	n, err := c.Reader.Read(b)
-	c.mu.Lock()
 	if n > 0 {
+		c.mu.Lock()
 		c.totalBytes += int64(n)
+		c.mu.Unlock()
 	}
-	c.mu.Unlock()
 
 	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
 		select {
@@ -207,9 +205,10 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 					c.mu.Unlock()
 
 					if delta < minBytes {
-						if c.enableLog && c.logFile != "" {
-							remoteAddr := c.Conn.RemoteAddr().String()
-							appendLog(c.logFile, remoteAddr+"\n")
+						if c.enableLog && c.logFile != "" && c.logMu != nil {
+							c.logMu.Lock()
+							appendLog(c.logFile, c.Conn.RemoteAddr().String()+"\n")
+							c.logMu.Unlock()
 						}
 						c.Close()
 						return
@@ -255,7 +254,7 @@ func (c *timeoutConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// appendLog 追加日志
+// appendLog 追加日志（简单安全写入）
 func appendLog(path, msg string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -283,4 +282,3 @@ func tlsVersionToString(v uint16) string {
 
 // 确保实现 layer4.ConnMatcher 接口
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
-
