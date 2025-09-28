@@ -119,6 +119,9 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 						if extType == 0x002b && extSize >= 3 {
 							listLen := int(data[extDataStart])
 							for i := extDataStart + 1; i < extDataStart+1+listLen; i += 2 {
+								if i+2 > extDataEnd {
+									break
+								}
 								sver := binary.BigEndian.Uint16(data[i : i+2])
 								if sver == tls.VersionTLS13 {
 									versionStr = "1.3"
@@ -164,6 +167,7 @@ type peekedConn struct {
 	totalBytes     int64
 	monitorOnce    sync.Once
 	monitorClosed  chan struct{}
+	closeOnce      sync.Once //确保 monitorClosed 只关闭一次
 	monitorEnabled bool
 	logFile        string
 	enableLog      bool
@@ -181,11 +185,9 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 
 	// 如果启用了监控器，并且发生错误，则关闭监控协程
 	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
-		select {
-		case <-c.monitorClosed:
-		default:
+		c.closeOnce.Do(func() {
 			close(c.monitorClosed)
-		}
+		})
 	}
 	return n, err
 }
@@ -235,11 +237,9 @@ func (c *peekedConn) Close() error {
 	defer c.mu.Unlock()
 
 	if c.monitorEnabled && c.monitorClosed != nil {
-		select {
-		case <-c.monitorClosed:
-		default:
+		c.closeOnce.Do(func() {
 			close(c.monitorClosed)
-		}
+		})
 	}
 
 	return c.Conn.Close()
