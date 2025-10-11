@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -83,7 +84,6 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 	versionStr := tlsVersionToString(version)
 
 	// =================== 尝试解析扩展 supported_versions (0x002b) ===================
-	// ClientHello 格式：SessionID -> CipherSuites -> Compression -> Extensions
 	if len(data) >= 44 {
 		sessionIDL := int(data[43]) // Session ID 长度
 		offset := 44 + sessionIDL   // 跳过 SessionID
@@ -167,7 +167,7 @@ type peekedConn struct {
 	totalBytes     int64
 	monitorOnce    sync.Once
 	monitorClosed  chan struct{}
-	closeOnce      sync.Once //确保 monitorClosed 只关闭一次
+	closeOnce      sync.Once
 	monitorEnabled bool
 	logFile        string
 	enableLog      bool
@@ -219,7 +219,7 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 							remoteAddr := c.Conn.RemoteAddr().String()
 							go appendLog(c.logFile, remoteAddr+"\n")
 						}
-						c.Close()
+						c.Close() // 这里会立即关闭并释放系统资源
 						return
 					}
 
@@ -231,7 +231,7 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 	})
 }
 
-// Close 安全关闭连接和监控器
+// ✅ 修改重点：Close 方法增强版（立即释放系统资源）
 func (c *peekedConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -240,6 +240,12 @@ func (c *peekedConn) Close() error {
 		c.closeOnce.Do(func() {
 			close(c.monitorClosed)
 		})
+	}
+
+	// ====== 立即释放 socket 资源，防止 TIME_WAIT ======
+	if tcpConn, ok := c.Conn.(*net.TCPConn); ok {
+		// SetLinger(0): 强制立即关闭连接并释放端口资源
+		_ = tcpConn.SetLinger(0)
 	}
 
 	return c.Conn.Close()
