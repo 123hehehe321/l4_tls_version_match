@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -279,3 +278,5 @@ func tlsVersionToString(v uint16) string {
 
 // 保证实现接口
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
+
+
