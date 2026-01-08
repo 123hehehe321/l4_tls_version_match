@@ -78,43 +78,35 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		return false, errors.New("not a ClientHello message")
 	}
 
-	// 默认读取 client_version 字段 (bytes 9-10)，可能是 TLS1.0~1.2
 	version := binary.BigEndian.Uint16(data[9:11])
 	versionStr := tlsVersionToString(version)
 
-	// =================== 尝试解析扩展 supported_versions (0x002b) ===================
 	if len(data) >= 44 {
-		sessionIDL := int(data[43]) // Session ID 长度
-		offset := 44 + sessionIDL   // 跳过 SessionID
+		sessionIDL := int(data[43])
+		offset := 44 + sessionIDL
 
-		// CipherSuites
 		if offset+2 <= len(data) {
 			cipherLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 			offset += 2 + cipherLen
 
-			// Compression
 			if offset < len(data) {
 				compLen := int(data[offset])
 				offset += 1 + compLen
 
-				// Extensions
 				if offset+2 <= len(data) {
 					extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 					offset += 2
 
-					// 遍历扩展
 					for extOff := offset; extOff+4 <= offset+extLen; {
 						extType := binary.BigEndian.Uint16(data[extOff : extOff+2])
 						extSize := int(binary.BigEndian.Uint16(data[extOff+2 : extOff+4]))
 						extDataStart := extOff + 4
 						extDataEnd := extDataStart + extSize
 
-						// 越界保护
 						if extDataEnd > offset+extLen {
 							break
 						}
 
-						// 找到 supported_versions 扩展
 						if extType == 0x002b && extSize >= 3 {
 							listLen := int(data[extDataStart])
 							for i := extDataStart + 1; i < extDataStart+1+listLen; i += 2 {
@@ -134,7 +126,6 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		}
 	}
 
-	// =================== 包装连接，避免 Peek 过的数据丢失 ===================
 	pconn := &peekedConn{
 		Conn:           rawConn,
 		Reader:         br,
@@ -143,22 +134,17 @@ func (m *TLSVersionMatcher) Match(conn *layer4.Connection) (bool, error) {
 		enableLog:      m.EnableLog,
 	}
 
-	// =================== 启动滑动窗口监控 ===================
 	if m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
 		pconn.monitorEnabled = true
 		pconn.StartMonitor(time.Duration(m.MaxIdleDuration), m.MinBytesRead)
 	}
 
 	conn.Conn = pconn
-
-	// 清除超时设置
 	_ = rawConn.SetReadDeadline(time.Time{})
 
-	// 返回是否匹配
 	return versionStr == m.Version, nil
 }
 
-// ========== 包装连接，带字节计数和监控 ==========
 type peekedConn struct {
 	net.Conn
 	Reader         io.Reader
@@ -172,7 +158,6 @@ type peekedConn struct {
 	enableLog      bool
 }
 
-// Read 包装读取操作，记录总字节数
 func (c *peekedConn) Read(b []byte) (int, error) {
 	n, err := c.Reader.Read(b)
 
@@ -182,16 +167,13 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 	}
 	c.mu.Unlock()
 
-	// 如果启用了监控器，并且发生错误，则关闭监控协程
-	if c.monitorEnabled && err != nil && c.monitorClosed != nil {
-		c.closeOnce.Do(func() {
-			close(c.monitorClosed)
-		})
+	if err == io.EOF {
+		c.Close()
 	}
+
 	return n, err
 }
 
-// StartMonitor 启动一个 goroutine 定期检测字节流量
 func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 	c.monitorOnce.Do(func() {
 		if window <= 0 || minBytes <= 0 {
@@ -212,13 +194,12 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 					lastTotal = c.totalBytes
 					c.mu.Unlock()
 
-					// 如果在窗口内流量不足，记录日志并关闭连接
 					if delta < minBytes {
 						if c.enableLog && c.logFile != "" {
 							remoteAddr := c.Conn.RemoteAddr().String()
 							go appendLog(c.logFile, remoteAddr+"\n")
 						}
-						c.Close() // 这里会立即关闭并释放系统资源
+						c.Close()
 						return
 					}
 
@@ -230,27 +211,19 @@ func (c *peekedConn) StartMonitor(window time.Duration, minBytes int64) {
 	})
 }
 
-// ✅ 修改重点：Close 方法增强版（立即释放系统资源）
 func (c *peekedConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var err error
 
-	if c.monitorEnabled && c.monitorClosed != nil {
-		c.closeOnce.Do(func() {
+	c.closeOnce.Do(func() {
+		if c.monitorClosed != nil {
 			close(c.monitorClosed)
-		})
-	}
+		}
+		err = c.Conn.Close()
+	})
 
-	// ====== 立即释放 socket 资源，防止 TIME_WAIT ======
-	if tcpConn, ok := c.Conn.(*net.TCPConn); ok {
-		// SetLinger(0): 强制立即关闭连接并释放端口资源
-		_ = tcpConn.SetLinger(0)
-	}
-
-	return c.Conn.Close()
+	return err
 }
 
-// 追加日志
 func appendLog(path, msg string) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -260,7 +233,6 @@ func appendLog(path, msg string) {
 	_, _ = f.WriteString(msg)
 }
 
-// ========== TLS版本转字符串 ==========
 func tlsVersionToString(v uint16) string {
 	switch v {
 	case tls.VersionTLS13:
@@ -276,7 +248,4 @@ func tlsVersionToString(v uint16) string {
 	}
 }
 
-// 保证实现接口
 var _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
-
-
