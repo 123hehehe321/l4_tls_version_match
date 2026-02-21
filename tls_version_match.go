@@ -21,6 +21,8 @@ func init() {
     caddy.RegisterModule(TLSVersionMatcher{})
 }
 
+// ── 常量 ──────────────────────────────────────────────────────────────────────
+
 const (
     tlsRecordHeaderLen      = 5
     tlsHandshake            = byte(0x16)
@@ -31,16 +33,30 @@ const (
     tlsVer12                = uint16(0x0303)
     tlsVer13                = uint16(0x0304)
     defaultHandshakeTimeout = 3 * time.Second
+    defaultCheckInterval    = 30 * time.Second
     peekBufSize             = tlsRecordHeaderLen + tlsMaxRecordLen
 )
 
+// ── 模块定义 ──────────────────────────────────────────────────────────────────
+
 type TLSVersionMatcher struct {
-    Version         string         `json:"version,omitempty"`
-    IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`
-    MaxIdleDuration caddy.Duration `json:"max_idle_duration,omitempty"`
-    MinBytesRead    int64          `json:"min_bytes_read,omitempty"`
-    LogFile         string         `json:"log_file,omitempty"`
-    EnableLog       bool           `json:"enable_log,omitempty"`
+    // TLS 版本："1.2" 或 "1.3"
+    Version string `json:"version,omitempty"`
+
+    // 握手阶段读取超时，默认 3s
+    IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
+
+    // 连接空闲超时：无任何读写超过此时间则 RST 断开
+    ConnIdleTimeout caddy.Duration `json:"conn_idle_timeout,omitempty"`
+
+    // 空闲检测间隔，默认 30s
+    CheckInterval caddy.Duration `json:"check_interval,omitempty"`
+
+    // 僵尸连接日志文件路径
+    LogFile string `json:"log_file,omitempty"`
+
+    // 是否记录僵尸连接日志
+    EnableLog bool `json:"enable_log,omitempty"`
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -57,18 +73,15 @@ func (m *TLSVersionMatcher) Validate() error {
             m.Version,
         )
     }
-    if (m.MaxIdleDuration == 0) != (m.MinBytesRead == 0) {
-        return errors.New(
-            "tls_version: max_idle_duration and min_bytes_read must be set together",
-        )
-    }
     return nil
 }
 
-// ✅ 正确签名：*TLSVersionMatcher, *layer4.Connection
+// ── Match 主逻辑 ──────────────────────────────────────────────────────────────
+
 func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     rawConn := cx.Conn
 
+    // Step1: 握手超时
     timeout := defaultHandshakeTimeout
     if m.IdleTimeout != 0 {
         timeout = time.Duration(m.IdleTimeout)
@@ -76,31 +89,44 @@ func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     _ = rawConn.SetReadDeadline(time.Now().Add(timeout))
     defer rawConn.SetReadDeadline(time.Time{})
 
+    // Step2: 启用 TCP Keepalive，内核层面检测死连接
+    setTCPOptions(rawConn)
+
+    // Step3: 提前替换连接，保证缓冲数据不丢失
     br := bufio.NewReaderSize(rawConn, peekBufSize)
     pc := newPeekedConn(rawConn, br)
     cx.Conn = pc
 
+    // Step4: 解析 ClientHello
     data, err := peekClientHello(br)
     if err != nil {
         return false, nil
     }
 
+    // Step5: 版本匹配
     matched, err := matchVersion(data, m.Version)
     if err != nil {
         return false, nil
     }
 
-    if matched && m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
+    // Step6: 匹配成功则启动应用层空闲检测
+    if matched && m.ConnIdleTimeout > 0 {
+        interval := time.Duration(m.CheckInterval)
+        if interval <= 0 {
+            interval = defaultCheckInterval
+        }
         pc.startZombieMonitor(zombieConfig{
-            window:    time.Duration(m.MaxIdleDuration),
-            minBytes:  m.MinBytesRead,
-            logFile:   m.LogFile,
-            enableLog: m.EnableLog,
+            connIdleTimeout: time.Duration(m.ConnIdleTimeout),
+            checkInterval:   interval,
+            logFile:         m.LogFile,
+            enableLog:       m.EnableLog,
         })
     }
 
     return matched, nil
 }
+
+// ── TLS 解析 ──────────────────────────────────────────────────────────────────
 
 func peekClientHello(br *bufio.Reader) ([]byte, error) {
     hdr, err := br.Peek(tlsRecordHeaderLen)
@@ -192,31 +218,49 @@ func hasTLS13(data []byte) bool {
     return false
 }
 
+// ── peekedConn ────────────────────────────────────────────────────────────────
+
 type peekedConn struct {
     net.Conn
-    reader    io.Reader
-    total     atomic.Int64
-    stopOnce  sync.Once
-    stopCh    chan struct{}
-    closeOnce sync.Once
+    reader     io.Reader
+    total      atomic.Int64 // 累计读取字节数
+    lastActive atomic.Int64 // 最后活跃时间戳 UnixNano
+    stopOnce   sync.Once
+    stopCh     chan struct{}
+    closeOnce  sync.Once
 }
 
 func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
-    return &peekedConn{
+    pc := &peekedConn{
         Conn:   c,
         reader: r,
         stopCh: make(chan struct{}),
     }
+    // 初始化活跃时间为连接建立时刻
+    pc.lastActive.Store(time.Now().UnixNano())
+    return pc
 }
 
+// Read 从 bufio 缓冲读取，同时更新活跃时间
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
         c.total.Add(int64(n))
+        c.lastActive.Store(time.Now().UnixNano())
     }
     return n, err
 }
 
+// Write 写入时同样更新活跃时间
+func (c *peekedConn) Write(b []byte) (int, error) {
+    n, err := c.Conn.Write(b)
+    if n > 0 {
+        c.lastActive.Store(time.Now().UnixNano())
+    }
+    return n, err
+}
+
+// Close 正常四次挥手关闭
 func (c *peekedConn) Close() error {
     var err error
     c.closeOnce.Do(func() {
@@ -226,6 +270,8 @@ func (c *peekedConn) Close() error {
     return err
 }
 
+// rstClose SO_LINGER(0) 强制 RST 断开
+// 不产生 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_2
 func (c *peekedConn) rstClose() {
     c.closeOnce.Do(func() {
         c.stopOnce.Do(func() { close(c.stopCh) })
@@ -234,45 +280,52 @@ func (c *peekedConn) rstClose() {
     })
 }
 
+// ── 僵尸连接监控 ──────────────────────────────────────────────────────────────
+
 type zombieConfig struct {
-    window    time.Duration
-    minBytes  int64
-    logFile   string
-    enableLog bool
+    connIdleTimeout time.Duration // 无任何读写超过此时间则断开
+    checkInterval   time.Duration // 检测间隔
+    logFile         string
+    enableLog       bool
 }
 
+// startZombieMonitor 真实空闲检测
+// 只要有任何读写就更新活跃时间
+// 连续空闲超过 connIdleTimeout 才断开
+// 不会误判低频正常连接
 func (c *peekedConn) startZombieMonitor(cfg zombieConfig) {
     go func() {
-        ticker := time.NewTicker(cfg.window)
+        ticker := time.NewTicker(cfg.checkInterval)
         defer ticker.Stop()
-        var lastBytes int64
-        first := true
+
         for {
             select {
             case <-ticker.C:
-                cur := c.total.Load()
-                delta := cur - lastBytes
-                lastBytes = cur
-                if first {
-                    first = false
-                    continue
-                }
-                if delta < cfg.minBytes {
+                lastActive := time.Unix(0, c.lastActive.Load())
+                idleDuration := time.Since(lastActive)
+
+                if idleDuration >= cfg.connIdleTimeout {
                     if cfg.enableLog && cfg.logFile != "" {
                         globalLogger.send(
                             cfg.logFile,
-                            c.Conn.RemoteAddr().String()+"\n",
+                            fmt.Sprintf("%s idle=%s\n",
+                                c.Conn.RemoteAddr().String(),
+                                idleDuration.Round(time.Second),
+                            ),
                         )
                     }
                     c.rstClose()
                     return
                 }
+
             case <-c.stopCh:
                 return
             }
         }
     }()
 }
+
+// ── 异步日志队列 ──────────────────────────────────────────────────────────────
 
 type logEntry struct {
     path string
@@ -293,11 +346,13 @@ func (l *asyncLogger) send(path, msg string) {
     select {
     case l.ch <- logEntry{path, msg}:
     default:
+        // 队列满时静默丢弃，不阻塞业务
     }
 }
 
 func (l *asyncLogger) run() {
     handles := make(map[string]*os.File)
+    // 每 5 分钟关闭重开文件句柄，兼容 logrotate
     cleanupTicker := time.NewTicker(5 * time.Minute)
     defer cleanupTicker.Stop()
     defer func() {
@@ -322,6 +377,7 @@ func (l *asyncLogger) run() {
                 handles[entry.path] = f
             }
             _, _ = f.WriteString(entry.msg)
+
         case <-cleanupTicker.C:
             for k, f := range handles {
                 _ = f.Close()
@@ -330,6 +386,21 @@ func (l *asyncLogger) run() {
         }
     }
 }
+
+// ── TCP 选项 ──────────────────────────────────────────────────────────────────
+
+// setTCPOptions 启用 TCP Keepalive
+// 内核层面检测死连接，与应用层空闲检测双重保障
+func setTCPOptions(conn net.Conn) {
+    tc, ok := conn.(*net.TCPConn)
+    if !ok {
+        return
+    }
+    _ = tc.SetKeepAlive(true)
+    _ = tc.SetKeepAlivePeriod(30 * time.Second)
+}
+
+// ── SO_LINGER(0) ─────────────────────────────────────────────────────────────
 
 func setLinger0(conn net.Conn) {
     if tc, ok := conn.(*net.TCPConn); ok {
@@ -353,9 +424,9 @@ func setLinger0(conn net.Conn) {
     }
 }
 
+// ── 接口验证 ──────────────────────────────────────────────────────────────────
+
 var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
-
-
