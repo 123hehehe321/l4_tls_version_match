@@ -67,6 +67,7 @@ func (m *TLSVersionMatcher) Validate() error {
 
 // ── Match 主逻辑 ──────────────────────────────────────────────────────────────
 
+// ✅ 正确签名
 func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     rawConn := cx.Conn
 
@@ -198,19 +199,15 @@ func hasTLS13(data []byte) bool {
 
 type peekedConn struct {
     net.Conn
-    reader     io.Reader
-    // ✅ 兼容 Go 1.19 以下：用 int64 + atomic 函数替代 atomic.Int64
-    total      int64
-    lastActive int64
-
-    wheelElem   *list.Element
-    wheelMu     sync.Mutex
+    reader      io.Reader
+    total       int64         // 累计读取字节（atomic）
+    lastActive  int64         // 最后活跃时间 UnixNano（atomic）
+    wheelElem   *list.Element // 时间轮槽位
+    wheelMu     sync.Mutex    // 保护 wheelElem
     idleTimeout time.Duration
-
-    logFile   string
-    enableLog bool
-
-    closeOnce sync.Once
+    logFile     string
+    enableLog   bool
+    closeOnce   sync.Once
 }
 
 func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
@@ -222,21 +219,21 @@ func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
     return pc
 }
 
+// Read 只更新 lastActive，不触碰时间轮锁
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
         atomic.AddInt64(&c.total, int64(n))
         atomic.StoreInt64(&c.lastActive, time.Now().UnixNano())
-        globalWheel.refresh(c)
     }
     return n, err
 }
 
+// Write 只更新 lastActive，不触碰时间轮锁
 func (c *peekedConn) Write(b []byte) (int, error) {
     n, err := c.Conn.Write(b)
     if n > 0 {
         atomic.StoreInt64(&c.lastActive, time.Now().UnixNano())
-        globalWheel.refresh(c)
     }
     return n, err
 }
@@ -261,11 +258,13 @@ func (c *peekedConn) rstClose() {
 // ── 时间轮 ────────────────────────────────────────────────────────────────────
 
 type timerWheel struct {
-    mu          sync.Mutex
-    slots       [wheelSlots]*list.List
-    currentSlot int
+    mu           sync.Mutex
+    slots        [wheelSlots]*list.List
+    currentSlot  int
     tickInterval time.Duration
 }
+
+var globalWheel = newTimerWheel(1 * time.Second)
 
 func newTimerWheel(tickInterval time.Duration) *timerWheel {
     tw := &timerWheel{tickInterval: tickInterval}
@@ -276,8 +275,6 @@ func newTimerWheel(tickInterval time.Duration) *timerWheel {
     return tw
 }
 
-var globalWheel = newTimerWheel(1 * time.Second)
-
 func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
     ticks := int(timeout / tw.tickInterval)
     if ticks <= 0 {
@@ -286,6 +283,7 @@ func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
     return (tw.currentSlot + ticks) % wheelSlots
 }
 
+// ✅ 正确签名
 func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.idleTimeout = timeout
     tw.mu.Lock()
@@ -298,28 +296,7 @@ func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.wheelMu.Unlock()
 }
 
-func (tw *timerWheel) refresh(pc *peekedConn) {
-    pc.wheelMu.Lock()
-    elem := pc.wheelElem
-    pc.wheelMu.Unlock()
-
-    if elem == nil {
-        return
-    }
-
-    tw.mu.Lock()
-    if elem.List() != nil {
-        elem.List().Remove(elem)
-    }
-    slot := tw.targetSlotLocked(pc.idleTimeout)
-    newElem := tw.slots[slot].PushBack(pc)
-    tw.mu.Unlock()
-
-    pc.wheelMu.Lock()
-    pc.wheelElem = newElem
-    pc.wheelMu.Unlock()
-}
-
+// ✅ 正确签名
 func (tw *timerWheel) remove(pc *peekedConn) {
     pc.wheelMu.Lock()
     elem := pc.wheelElem
@@ -352,20 +329,22 @@ func (tw *timerWheel) run() {
         for elem := slot.Front(); elem != nil; {
             next := elem.Next()
             pc := elem.Value.(*peekedConn)
-            lastActive := time.Unix(
-                0, atomic.LoadInt64(&pc.lastActive),
-            )
+            lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
+
             if time.Since(lastActive) >= pc.idleTimeout {
                 slot.Remove(elem)
+                pc.wheelMu.Lock()
+                pc.wheelElem = nil
+                pc.wheelMu.Unlock()
                 expired = append(expired, pc)
             } else {
+                // 活跃过，重新放入未来槽位
                 slot.Remove(elem)
                 requeue = append(requeue, pc)
             }
             elem = next
         }
 
-        // 重新入队未真正超时的连接
         for _, pc := range requeue {
             newSlot := tw.targetSlotLocked(pc.idleTimeout)
             newElem := tw.slots[newSlot].PushBack(pc)
@@ -375,15 +354,13 @@ func (tw *timerWheel) run() {
         }
         tw.mu.Unlock()
 
-        // 锁外执行关闭
+        // 锁外执行关闭和日志
         for _, pc := range expired {
             if pc.enableLog && pc.logFile != "" {
-                lastActive := time.Unix(
-                    0, atomic.LoadInt64(&pc.lastActive),
-                )
+                lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
                 globalLogger.send(
                     pc.logFile,
-                    fmt.Sprintf("%s idle=%s\n",
+                    fmt.Sprintf("%s idle=%s rst=1\n",
                         pc.Conn.RemoteAddr().String(),
                         time.Since(lastActive).Round(time.Second),
                     ),
@@ -453,7 +430,7 @@ func (l *asyncLogger) run() {
     }
 }
 
-// ── TCP 选项（完整 Keepalive，兼容 Debian 9）────────────────────────────────
+// ── TCP 选项 ──────────────────────────────────────────────────────────────────
 
 func setTCPOptions(conn net.Conn) {
     tc, ok := conn.(*net.TCPConn)
@@ -462,27 +439,14 @@ func setTCPOptions(conn net.Conn) {
     }
     _ = tc.SetKeepAlive(true)
     _ = tc.SetKeepAlivePeriod(30 * time.Second)
-
     raw, err := tc.SyscallConn()
     if err != nil {
         return
     }
     _ = raw.Control(func(fd uintptr) {
-        // 30s 无数据开始探测
-        _ = syscall.SetsockoptInt(
-            int(fd), syscall.IPPROTO_TCP,
-            syscall.TCP_KEEPIDLE, 30,
-        )
-        // 每 10s 发一次探测包
-        _ = syscall.SetsockoptInt(
-            int(fd), syscall.IPPROTO_TCP,
-            syscall.TCP_KEEPINTVL, 10,
-        )
-        // 探测 3 次无响应断开
-        _ = syscall.SetsockoptInt(
-            int(fd), syscall.IPPROTO_TCP,
-            syscall.TCP_KEEPCNT, 3,
-        )
+        _ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, 30)
+        _ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, 10)
+        _ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, 3)
     })
 }
 
@@ -516,6 +480,4 @@ var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
-
-
 
