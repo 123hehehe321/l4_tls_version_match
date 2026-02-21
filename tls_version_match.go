@@ -2,6 +2,7 @@ package tlsversionmatch
 
 import (
     "bufio"
+    "container/list"
     "encoding/binary"
     "errors"
     "fmt"
@@ -33,30 +34,21 @@ const (
     tlsVer12                = uint16(0x0303)
     tlsVer13                = uint16(0x0304)
     defaultHandshakeTimeout = 3 * time.Second
-    defaultCheckInterval    = 30 * time.Second
-    peekBufSize             = tlsRecordHeaderLen + tlsMaxRecordLen
+
+    peekBufSize = tlsRecordHeaderLen + tlsMaxRecordLen
+
+    // 时间轮槽数，槽越多精度越高
+    wheelSlots = 256
 )
 
 // ── 模块定义 ──────────────────────────────────────────────────────────────────
 
 type TLSVersionMatcher struct {
-    // TLS 版本："1.2" 或 "1.3"
-    Version string `json:"version,omitempty"`
-
-    // 握手阶段读取超时，默认 3s
-    IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
-
-    // 连接空闲超时：无任何读写超过此时间则 RST 断开
+    Version         string         `json:"version,omitempty"`
+    IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`
     ConnIdleTimeout caddy.Duration `json:"conn_idle_timeout,omitempty"`
-
-    // 空闲检测间隔，默认 30s
-    CheckInterval caddy.Duration `json:"check_interval,omitempty"`
-
-    // 僵尸连接日志文件路径
-    LogFile string `json:"log_file,omitempty"`
-
-    // 是否记录僵尸连接日志
-    EnableLog bool `json:"enable_log,omitempty"`
+    LogFile         string         `json:"log_file,omitempty"`
+    EnableLog       bool           `json:"enable_log,omitempty"`
 }
 
 func (TLSVersionMatcher) CaddyModule() caddy.ModuleInfo {
@@ -89,10 +81,10 @@ func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     _ = rawConn.SetReadDeadline(time.Now().Add(timeout))
     defer rawConn.SetReadDeadline(time.Time{})
 
-    // Step2: 启用 TCP Keepalive，内核层面检测死连接
+    // Step2: TCP Keepalive 内核层兜底
     setTCPOptions(rawConn)
 
-    // Step3: 提前替换连接，保证缓冲数据不丢失
+    // Step3: 替换连接保留缓冲
     br := bufio.NewReaderSize(rawConn, peekBufSize)
     pc := newPeekedConn(rawConn, br)
     cx.Conn = pc
@@ -109,18 +101,13 @@ func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
         return false, nil
     }
 
-    // Step6: 匹配成功则启动应用层空闲检测
+    // Step6: 匹配成功，注册到时间轮
     if matched && m.ConnIdleTimeout > 0 {
-        interval := time.Duration(m.CheckInterval)
-        if interval <= 0 {
-            interval = defaultCheckInterval
-        }
-        pc.startZombieMonitor(zombieConfig{
-            connIdleTimeout: time.Duration(m.ConnIdleTimeout),
-            checkInterval:   interval,
-            logFile:         m.LogFile,
-            enableLog:       m.EnableLog,
-        })
+        idleTimeout := time.Duration(m.ConnIdleTimeout)
+        pc.logFile = m.LogFile
+        pc.enableLog = m.EnableLog
+        // 注册到全局时间轮
+        globalWheel.register(pc, idleTimeout)
     }
 
     return matched, nil
@@ -223,106 +210,231 @@ func hasTLS13(data []byte) bool {
 type peekedConn struct {
     net.Conn
     reader     io.Reader
-    total      atomic.Int64 // 累计读取字节数
-    lastActive atomic.Int64 // 最后活跃时间戳 UnixNano
-    stopOnce   sync.Once
-    stopCh     chan struct{}
-    closeOnce  sync.Once
+    total      atomic.Int64
+    lastActive atomic.Int64 // UnixNano 最后活跃时间
+
+    // 时间轮相关
+    wheelElem   *list.Element // 在时间轮槽链表中的位置
+    wheelMu     sync.Mutex    // 保护 wheelElem
+    idleTimeout time.Duration // 该连接的超时阈值
+
+    // 日志
+    logFile   string
+    enableLog bool
+
+    closeOnce sync.Once
 }
 
 func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
     pc := &peekedConn{
         Conn:   c,
         reader: r,
-        stopCh: make(chan struct{}),
     }
-    // 初始化活跃时间为连接建立时刻
     pc.lastActive.Store(time.Now().UnixNano())
     return pc
 }
 
-// Read 从 bufio 缓冲读取，同时更新活跃时间
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
         c.total.Add(int64(n))
         c.lastActive.Store(time.Now().UnixNano())
+        // 有数据：通知时间轮重置超时
+        globalWheel.refresh(c)
     }
     return n, err
 }
 
-// Write 写入时同样更新活跃时间
 func (c *peekedConn) Write(b []byte) (int, error) {
     n, err := c.Conn.Write(b)
     if n > 0 {
         c.lastActive.Store(time.Now().UnixNano())
+        // 有数据：通知时间轮重置超时
+        globalWheel.refresh(c)
     }
     return n, err
 }
 
-// Close 正常四次挥手关闭
 func (c *peekedConn) Close() error {
     var err error
     c.closeOnce.Do(func() {
-        c.stopOnce.Do(func() { close(c.stopCh) })
+        // 从时间轮移除
+        globalWheel.remove(c)
         err = c.Conn.Close()
     })
     return err
 }
 
-// rstClose SO_LINGER(0) 强制 RST 断开
-// 不产生 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_2
 func (c *peekedConn) rstClose() {
     c.closeOnce.Do(func() {
-        c.stopOnce.Do(func() { close(c.stopCh) })
+        globalWheel.remove(c)
         setLinger0(c.Conn)
         c.Conn.Close()
     })
 }
 
-// ── 僵尸连接监控 ──────────────────────────────────────────────────────────────
+// ── 时间轮 ────────────────────────────────────────────────────────────────────
 
-type zombieConfig struct {
-    connIdleTimeout time.Duration // 无任何读写超过此时间则断开
-    checkInterval   time.Duration // 检测间隔
-    logFile         string
-    enableLog       bool
+// timerWheel 单个全局 goroutine 管理所有连接的超时
+// 原理：
+//   slots[256] 每个槽代表一个时间片
+//   连接注册时放入对应槽
+//   指针每 tickInterval 前进一槽
+//   指针扫过的槽里的连接检查是否真正超时
+type timerWheel struct {
+    mu           sync.Mutex
+    slots        [wheelSlots]*list.List // 时间槽
+    currentSlot  int                   // 当前指针位置
+    tickInterval time.Duration         // 每槽时间精度
 }
 
-// startZombieMonitor 真实空闲检测
-// 只要有任何读写就更新活跃时间
-// 连续空闲超过 connIdleTimeout 才断开
-// 不会误判低频正常连接
-func (c *peekedConn) startZombieMonitor(cfg zombieConfig) {
-    go func() {
-        ticker := time.NewTicker(cfg.checkInterval)
-        defer ticker.Stop()
+func newTimerWheel(tickInterval time.Duration) *timerWheel {
+    tw := &timerWheel{
+        tickInterval: tickInterval,
+    }
+    for i := range tw.slots {
+        tw.slots[i] = list.New()
+    }
+    go tw.run()
+    return tw
+}
 
-        for {
-            select {
-            case <-ticker.C:
-                lastActive := time.Unix(0, c.lastActive.Load())
-                idleDuration := time.Since(lastActive)
+// 全局时间轮：精度 1s，256槽覆盖 256s
+// 对于 600s 超时，连接会被放入 600%256=88 号槽的下一轮
+// 时间轮会转多圈，每次扫到时检查真实 lastActive
+var globalWheel = newTimerWheel(1 * time.Second)
 
-                if idleDuration >= cfg.connIdleTimeout {
-                    if cfg.enableLog && cfg.logFile != "" {
-                        globalLogger.send(
-                            cfg.logFile,
-                            fmt.Sprintf("%s idle=%s\n",
-                                c.Conn.RemoteAddr().String(),
-                                idleDuration.Round(time.Second),
-                            ),
-                        )
-                    }
-                    c.rstClose()
-                    return
-                }
+// register 将连接注册到时间轮
+func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
+    pc.idleTimeout = timeout
+    tw.mu.Lock()
+    defer tw.mu.Unlock()
 
-            case <-c.stopCh:
-                return
+    slot := tw.targetSlot(timeout)
+    elem := tw.slots[slot].PushBack(pc)
+
+    pc.wheelMu.Lock()
+    pc.wheelElem = elem
+    pc.wheelMu.Unlock()
+}
+
+// refresh 连接有活动时，重新放入对应槽
+func (tw *timerWheel) refresh(pc *peekedConn) {
+    tw.mu.Lock()
+    defer tw.mu.Unlock()
+
+    pc.wheelMu.Lock()
+    elem := pc.wheelElem
+    pc.wheelMu.Unlock()
+
+    if elem == nil {
+        return
+    }
+
+    // 从当前槽移除
+    for i := range tw.slots {
+        if tw.slots[i] == elem.List() {
+            tw.slots[i].Remove(elem)
+            break
+        }
+    }
+
+    // 重新放入新槽
+    slot := tw.targetSlot(pc.idleTimeout)
+    newElem := tw.slots[slot].PushBack(pc)
+
+    pc.wheelMu.Lock()
+    pc.wheelElem = newElem
+    pc.wheelMu.Unlock()
+}
+
+// remove 连接关闭时从时间轮移除
+func (tw *timerWheel) remove(pc *peekedConn) {
+    tw.mu.Lock()
+    defer tw.mu.Unlock()
+
+    pc.wheelMu.Lock()
+    elem := pc.wheelElem
+    pc.wheelElem = nil
+    pc.wheelMu.Unlock()
+
+    if elem == nil {
+        return
+    }
+
+    for i := range tw.slots {
+        if tw.slots[i] == elem.List() {
+            tw.slots[i].Remove(elem)
+            return
+        }
+    }
+}
+
+// targetSlot 计算目标槽位
+func (tw *timerWheel) targetSlot(timeout time.Duration) int {
+    ticks := int(timeout / tw.tickInterval)
+    tw.mu.Lock()
+    slot := (tw.currentSlot + ticks) % wheelSlots
+    tw.mu.Unlock()
+    return slot
+}
+
+// run 时间轮驱动 goroutine，全局唯一
+func (tw *timerWheel) run() {
+    ticker := time.NewTicker(tw.tickInterval)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        tw.mu.Lock()
+        tw.currentSlot = (tw.currentSlot + 1) % wheelSlots
+        slot := tw.slots[tw.currentSlot]
+
+        // 收集当前槽所有连接
+        var expired []*peekedConn
+        for elem := slot.Front(); elem != nil; elem = elem.Next() {
+            pc := elem.Value.(*peekedConn)
+            idleDuration := time.Since(
+                time.Unix(0, pc.lastActive.Load()),
+            )
+            if idleDuration >= pc.idleTimeout {
+                // 真正超时，加入待关闭列表
+                expired = append(expired, pc)
+            } else {
+                // 未真正超时（时间轮转了一圈但连接仍活跃）
+                // 重新放入正确的槽
+                slot.Remove(elem)
+                newSlot := tw.targetSlotLocked(pc.idleTimeout)
+                newElem := tw.slots[newSlot].PushBack(pc)
+                pc.wheelMu.Lock()
+                pc.wheelElem = newElem
+                pc.wheelMu.Unlock()
             }
         }
-    }()
+        tw.mu.Unlock()
+
+        // 在锁外执行关闭，避免死锁
+        for _, pc := range expired {
+            if pc.enableLog && pc.logFile != "" {
+                idleDuration := time.Since(
+                    time.Unix(0, pc.lastActive.Load()),
+                )
+                globalLogger.send(
+                    pc.logFile,
+                    fmt.Sprintf("%s idle=%s\n",
+                        pc.Conn.RemoteAddr().String(),
+                        idleDuration.Round(time.Second),
+                    ),
+                )
+            }
+            pc.rstClose()
+        }
+    }
+}
+
+// targetSlotLocked 在已持有锁时计算槽位
+func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
+    ticks := int(timeout / tw.tickInterval)
+    return (tw.currentSlot + ticks) % wheelSlots
 }
 
 // ── 异步日志队列 ──────────────────────────────────────────────────────────────
@@ -346,13 +458,11 @@ func (l *asyncLogger) send(path, msg string) {
     select {
     case l.ch <- logEntry{path, msg}:
     default:
-        // 队列满时静默丢弃，不阻塞业务
     }
 }
 
 func (l *asyncLogger) run() {
     handles := make(map[string]*os.File)
-    // 每 5 分钟关闭重开文件句柄，兼容 logrotate
     cleanupTicker := time.NewTicker(5 * time.Minute)
     defer cleanupTicker.Stop()
     defer func() {
@@ -389,8 +499,6 @@ func (l *asyncLogger) run() {
 
 // ── TCP 选项 ──────────────────────────────────────────────────────────────────
 
-// setTCPOptions 启用 TCP Keepalive
-// 内核层面检测死连接，与应用层空闲检测双重保障
 func setTCPOptions(conn net.Conn) {
     tc, ok := conn.(*net.TCPConn)
     if !ok {
