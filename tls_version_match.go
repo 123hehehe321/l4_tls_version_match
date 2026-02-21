@@ -21,7 +21,6 @@ func init() {
     caddy.RegisterModule(TLSVersionMatcher{})
 }
 
-// ── 常量 ──────────────────────────────────────────────────────────────────────
 const (
     tlsRecordHeaderLen      = 5
     tlsHandshake            = byte(0x16)
@@ -32,10 +31,9 @@ const (
     tlsVer12                = uint16(0x0303)
     tlsVer13                = uint16(0x0304)
     defaultHandshakeTimeout = 3 * time.Second
-    peekBufSize             = tlsRecordHeaderLen + tlsMaxRecordLen // 16389，防止大包 ErrBufferFull
+    peekBufSize             = tlsRecordHeaderLen + tlsMaxRecordLen
 )
 
-// ── 模块定义 ──────────────────────────────────────────────────────────────────
 type TLSVersionMatcher struct {
     Version         string         `json:"version,omitempty"`
     IdleTimeout     caddy.Duration `json:"idle_timeout,omitempty"`
@@ -67,40 +65,31 @@ func (m *TLSVersionMatcher) Validate() error {
     return nil
 }
 
-// ── Match 主逻辑 ──────────────────────────────────────────────────────────────
+// ✅ 正确签名：*TLSVersionMatcher, *layer4.Connection
 func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     rawConn := cx.Conn
 
-    // 1. 设置握手超时
     timeout := defaultHandshakeTimeout
     if m.IdleTimeout != 0 {
         timeout = time.Duration(m.IdleTimeout)
     }
     _ = rawConn.SetReadDeadline(time.Now().Add(timeout))
-
-    // defer 统一清除 deadline，无论哪条路径返回都不影响后续路由
     defer rawConn.SetReadDeadline(time.Time{})
 
     br := bufio.NewReaderSize(rawConn, peekBufSize)
-    
-    // 2. 极其重要：提前替换连接，保证即使后续匹配失败，缓冲数据也不丢失
     pc := newPeekedConn(rawConn, br)
     cx.Conn = pc
 
-    // 3. 窥探握手包
     data, err := peekClientHello(br)
     if err != nil {
-        // 非 TLS 流量，返回 false 让其他路由继续匹配
         return false, nil
     }
 
-    // 4. 解析版本
     matched, err := matchVersion(data, m.Version)
     if err != nil {
         return false, nil
     }
 
-    // 5. 匹配成功时启动僵尸监控
     if matched && m.MaxIdleDuration > 0 && m.MinBytesRead > 0 {
         pc.startZombieMonitor(zombieConfig{
             window:    time.Duration(m.MaxIdleDuration),
@@ -113,7 +102,6 @@ func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     return matched, nil
 }
 
-// ── TLS 解析 ──────────────────────────────────────────────────────────────────
 func peekClientHello(br *bufio.Reader) ([]byte, error) {
     hdr, err := br.Peek(tlsRecordHeaderLen)
     if err != nil {
@@ -122,23 +110,19 @@ func peekClientHello(br *bufio.Reader) ([]byte, error) {
     if hdr[0] != tlsHandshake {
         return nil, errors.New("not tls handshake")
     }
-
     recVer := binary.BigEndian.Uint16(hdr[1:3])
     if recVer < 0x0301 || recVer > 0x0304 {
         return nil, errors.New("invalid record version")
     }
-
     recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
     if recLen < tlsMinRecordLen || recLen > tlsMaxRecordLen {
         return nil, errors.New("invalid record length")
     }
-
     total := tlsRecordHeaderLen + recLen
     data, err := br.Peek(total)
     if err != nil {
         return nil, err
     }
-
     if data[5] != tlsClientHello {
         return nil, errors.New("not clienthello")
     }
@@ -153,7 +137,6 @@ func matchVersion(data []byte, target string) (bool, error) {
     if legacyVer < tlsVer12 {
         return false, nil
     }
-
     var detected string
     if hasTLS13(data) {
         detected = "1.3"
@@ -168,21 +151,22 @@ func hasTLS13(data []byte) bool {
         return false
     }
     pos := 44 + int(data[43])
-
-    if pos+2 > len(data) { return false }
+    if pos+2 > len(data) {
+        return false
+    }
     pos += 2 + int(binary.BigEndian.Uint16(data[pos:pos+2]))
-    
-    if pos+1 > len(data) { return false }
+    if pos+1 > len(data) {
+        return false
+    }
     pos += 1 + int(data[pos])
-    
-    if pos+2 > len(data) { return false }
+    if pos+2 > len(data) {
+        return false
+    }
     extEnd := pos + 2 + int(binary.BigEndian.Uint16(data[pos:pos+2]))
     pos += 2
-    
     if extEnd > len(data) {
         extEnd = len(data)
     }
-
     for pos+4 <= extEnd {
         extType := binary.BigEndian.Uint16(data[pos : pos+2])
         extLen := int(binary.BigEndian.Uint16(data[pos+2 : pos+4]))
@@ -208,7 +192,6 @@ func hasTLS13(data []byte) bool {
     return false
 }
 
-// ── peekedConn ────────────────────────────────────────────────────────────────
 type peekedConn struct {
     net.Conn
     reader    io.Reader
@@ -251,7 +234,6 @@ func (c *peekedConn) rstClose() {
     })
 }
 
-// ── 僵尸连接监控 ──────────────────────────────────────────────────────────────
 type zombieConfig struct {
     window    time.Duration
     minBytes  int64
@@ -264,25 +246,23 @@ func (c *peekedConn) startZombieMonitor(cfg zombieConfig) {
         ticker := time.NewTicker(cfg.window)
         defer ticker.Stop()
         var lastBytes int64
-        // 跳过第一个周期，避免连接刚建立 delta=0 被误判
         first := true
-
         for {
             select {
             case <-ticker.C:
                 cur := c.total.Load()
                 delta := cur - lastBytes
                 lastBytes = cur
-
                 if first {
                     first = false
                     continue
                 }
-
                 if delta < cfg.minBytes {
                     if cfg.enableLog && cfg.logFile != "" {
-                        // 通过全局异步队列写日志，防阻塞
-                        globalLogger.send(cfg.logFile, c.Conn.RemoteAddr().String()+"\n")
+                        globalLogger.send(
+                            cfg.logFile,
+                            c.Conn.RemoteAddr().String()+"\n",
+                        )
                     }
                     c.rstClose()
                     return
@@ -294,7 +274,6 @@ func (c *peekedConn) startZombieMonitor(cfg zombieConfig) {
     }()
 }
 
-// ── 异步日志队列 ──────────────────────────────────────────────────────────────
 type logEntry struct {
     path string
     msg  string
@@ -304,7 +283,6 @@ type asyncLogger struct {
     ch chan logEntry
 }
 
-// 全局日志队列，缓冲 1024 条，满时静默丢弃（不阻塞业务）
 var globalLogger = func() *asyncLogger {
     l := &asyncLogger{ch: make(chan logEntry, 1024)}
     go l.run()
@@ -315,23 +293,18 @@ func (l *asyncLogger) send(path, msg string) {
     select {
     case l.ch <- logEntry{path, msg}:
     default:
-        // 丢弃策略，保护主协程
     }
 }
 
 func (l *asyncLogger) run() {
     handles := make(map[string]*os.File)
-    
-    // 定期清理文件句柄，完美兼容 logrotate 日志轮转，防止磁盘 fd 泄漏
     cleanupTicker := time.NewTicker(5 * time.Minute)
     defer cleanupTicker.Stop()
-
     defer func() {
         for _, f := range handles {
             _ = f.Close()
         }
     }()
-
     for {
         select {
         case entry := <-l.ch:
@@ -349,10 +322,7 @@ func (l *asyncLogger) run() {
                 handles[entry.path] = f
             }
             _, _ = f.WriteString(entry.msg)
-
         case <-cleanupTicker.C:
-            // 每 5 分钟关闭一次所有打开的文件句柄，下一次写入时会自动重新打开。
-            // 这保证了如果外部删除了日志文件，空间可以被迅速释放。
             for k, f := range handles {
                 _ = f.Close()
                 delete(handles, k)
@@ -361,7 +331,6 @@ func (l *asyncLogger) run() {
     }
 }
 
-// ── SO_LINGER(0) ─────────────────────────────────────────────────────────────
 func setLinger0(conn net.Conn) {
     if tc, ok := conn.(*net.TCPConn); ok {
         _ = tc.SetLinger(0)
@@ -384,11 +353,9 @@ func setLinger0(conn net.Conn) {
     }
 }
 
-// ── 接口验证 ──────────────────────────────────────────────────────────────────
 var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
-
 
 
