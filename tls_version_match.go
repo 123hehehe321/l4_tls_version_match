@@ -18,7 +18,15 @@ import (
     "github.com/mholt/caddy-l4/layer4"
 )
 
+// ── 全局变量（延迟初始化，避免循环依赖）────────────────────────────────────
+
+var globalWheel *timerWheel  // ✅ 修复1：声明但不初始化
+var globalLogger *asyncLogger
+
 func init() {
+    // ✅ 修复1：在 init 中初始化，打破循环依赖
+    globalWheel = newTimerWheel(1 * time.Second)
+    globalLogger = newAsyncLogger()
     caddy.RegisterModule(TLSVersionMatcher{})
 }
 
@@ -67,7 +75,6 @@ func (m *TLSVersionMatcher) Validate() error {
 
 // ── Match 主逻辑 ──────────────────────────────────────────────────────────────
 
-// ✅ 正确签名
 func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     rawConn := cx.Conn
 
@@ -200,10 +207,10 @@ func hasTLS13(data []byte) bool {
 type peekedConn struct {
     net.Conn
     reader      io.Reader
-    total       int64         // 累计读取字节（atomic）
-    lastActive  int64         // 最后活跃时间 UnixNano（atomic）
-    wheelElem   *list.Element // 时间轮槽位
-    wheelMu     sync.Mutex    // 保护 wheelElem
+    total       int64
+    lastActive  int64
+    wheelElem   *list.Element
+    wheelMu     sync.Mutex
     idleTimeout time.Duration
     logFile     string
     enableLog   bool
@@ -219,7 +226,6 @@ func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
     return pc
 }
 
-// Read 只更新 lastActive，不触碰时间轮锁
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
@@ -229,7 +235,6 @@ func (c *peekedConn) Read(b []byte) (int, error) {
     return n, err
 }
 
-// Write 只更新 lastActive，不触碰时间轮锁
 func (c *peekedConn) Write(b []byte) (int, error) {
     n, err := c.Conn.Write(b)
     if n > 0 {
@@ -249,6 +254,7 @@ func (c *peekedConn) Close() error {
 
 func (c *peekedConn) rstClose() {
     c.closeOnce.Do(func() {
+        // ✅ 修复1：globalWheel 已通过 init() 初始化，无循环依赖
         globalWheel.remove(c)
         setLinger0(c.Conn)
         c.Conn.Close()
@@ -263,8 +269,6 @@ type timerWheel struct {
     currentSlot  int
     tickInterval time.Duration
 }
-
-var globalWheel = newTimerWheel(1 * time.Second)
 
 func newTimerWheel(tickInterval time.Duration) *timerWheel {
     tw := &timerWheel{tickInterval: tickInterval}
@@ -283,7 +287,6 @@ func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
     return (tw.currentSlot + ticks) % wheelSlots
 }
 
-// ✅ 正确签名
 func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.idleTimeout = timeout
     tw.mu.Lock()
@@ -296,7 +299,6 @@ func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.wheelMu.Unlock()
 }
 
-// ✅ 正确签名
 func (tw *timerWheel) remove(pc *peekedConn) {
     pc.wheelMu.Lock()
     elem := pc.wheelElem
@@ -307,9 +309,13 @@ func (tw *timerWheel) remove(pc *peekedConn) {
         return
     }
 
+    // ✅ 修复2：不用 elem.List()，改为遍历所有槽找到并删除
     tw.mu.Lock()
-    if elem.List() != nil {
-        elem.List().Remove(elem)
+    for i := range tw.slots {
+        if tw.slots[i] == elem.List() {
+            tw.slots[i].Remove(elem)
+            break
+        }
     }
     tw.mu.Unlock()
 }
@@ -338,7 +344,6 @@ func (tw *timerWheel) run() {
                 pc.wheelMu.Unlock()
                 expired = append(expired, pc)
             } else {
-                // 活跃过，重新放入未来槽位
                 slot.Remove(elem)
                 requeue = append(requeue, pc)
             }
@@ -354,7 +359,6 @@ func (tw *timerWheel) run() {
         }
         tw.mu.Unlock()
 
-        // 锁外执行关闭和日志
         for _, pc := range expired {
             if pc.enableLog && pc.logFile != "" {
                 lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
@@ -382,11 +386,11 @@ type asyncLogger struct {
     ch chan logEntry
 }
 
-var globalLogger = func() *asyncLogger {
+func newAsyncLogger() *asyncLogger {
     l := &asyncLogger{ch: make(chan logEntry, 1024)}
     go l.run()
     return l
-}()
+}
 
 func (l *asyncLogger) send(path, msg string) {
     select {
@@ -421,6 +425,7 @@ func (l *asyncLogger) run() {
                 handles[entry.path] = f
             }
             _, _ = f.WriteString(entry.msg)
+
         case <-cleanupTicker.C:
             for k, f := range handles {
                 _ = f.Close()
@@ -480,6 +485,5 @@ var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
-
 
 
