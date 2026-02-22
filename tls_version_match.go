@@ -18,13 +18,12 @@ import (
     "github.com/mholt/caddy-l4/layer4"
 )
 
-// ── 全局变量（延迟初始化，避免循环依赖）────────────────────────────────────
+// ── 全局变量 ──────────────────────────────────────────────────────────────────
 
-var globalWheel *timerWheel  // ✅ 修复1：声明但不初始化
+var globalWheel *timerWheel
 var globalLogger *asyncLogger
 
 func init() {
-    // ✅ 修复1：在 init 中初始化，打破循环依赖
     globalWheel = newTimerWheel(1 * time.Second)
     globalLogger = newAsyncLogger()
     caddy.RegisterModule(TLSVersionMatcher{})
@@ -207,10 +206,11 @@ func hasTLS13(data []byte) bool {
 type peekedConn struct {
     net.Conn
     reader      io.Reader
-    total       int64
-    lastActive  int64
-    wheelElem   *list.Element
-    wheelMu     sync.Mutex
+    total       int64         // 累计读取字节（atomic）
+    lastActive  int64         // 最后活跃时间 UnixNano（atomic）
+    wheelElem   *list.Element // 时间轮节点
+    wheelList   *list.List    // 直接保存链表引用，O(1) 删除无需知道槽位
+    wheelMu     sync.Mutex    // 保护 wheelElem / wheelList
     idleTimeout time.Duration
     logFile     string
     enableLog   bool
@@ -226,6 +226,7 @@ func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
     return pc
 }
 
+// Read 从 bufio 缓冲读取，更新活跃时间（无锁）
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
@@ -235,6 +236,7 @@ func (c *peekedConn) Read(b []byte) (int, error) {
     return n, err
 }
 
+// Write 更新活跃时间（无锁）
 func (c *peekedConn) Write(b []byte) (int, error) {
     n, err := c.Conn.Write(b)
     if n > 0 {
@@ -243,6 +245,7 @@ func (c *peekedConn) Write(b []byte) (int, error) {
     return n, err
 }
 
+// Close 正常四次挥手关闭
 func (c *peekedConn) Close() error {
     var err error
     c.closeOnce.Do(func() {
@@ -252,9 +255,10 @@ func (c *peekedConn) Close() error {
     return err
 }
 
+// rstClose SO_LINGER(0) 强制 RST 断开
+// 不产生 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_2
 func (c *peekedConn) rstClose() {
     c.closeOnce.Do(func() {
-        // ✅ 修复1：globalWheel 已通过 init() 初始化，无循环依赖
         globalWheel.remove(c)
         setLinger0(c.Conn)
         c.Conn.Close()
@@ -287,39 +291,42 @@ func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
     return (tw.currentSlot + ticks) % wheelSlots
 }
 
+// register 注册连接到时间轮
 func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.idleTimeout = timeout
+
     tw.mu.Lock()
     slot := tw.targetSlotLocked(timeout)
-    elem := tw.slots[slot].PushBack(pc)
+    l := tw.slots[slot]
+    elem := l.PushBack(pc)
     tw.mu.Unlock()
 
+    // 同时保存节点和链表引用，remove 时 O(1) 直接调用 l.Remove(elem)
     pc.wheelMu.Lock()
     pc.wheelElem = elem
+    pc.wheelList = l
     pc.wheelMu.Unlock()
 }
 
+// remove 从时间轮移除连接，O(1)
 func (tw *timerWheel) remove(pc *peekedConn) {
     pc.wheelMu.Lock()
     elem := pc.wheelElem
+    l := pc.wheelList
     pc.wheelElem = nil
+    pc.wheelList = nil
     pc.wheelMu.Unlock()
 
-    if elem == nil {
+    if elem == nil || l == nil {
         return
     }
 
-    // ✅ 修复2：不用 elem.List()，改为遍历所有槽找到并删除
     tw.mu.Lock()
-    for i := range tw.slots {
-        if tw.slots[i] == elem.List() {
-            tw.slots[i].Remove(elem)
-            break
-        }
-    }
+    l.Remove(elem) // O(1)：container/list 双向链表直接操作前后指针
     tw.mu.Unlock()
 }
 
+// run 时间轮驱动，全局唯一 goroutine
 func (tw *timerWheel) run() {
     ticker := time.NewTicker(tw.tickInterval)
     defer ticker.Stop()
@@ -338,27 +345,34 @@ func (tw *timerWheel) run() {
             lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
 
             if time.Since(lastActive) >= pc.idleTimeout {
+                // 真正超时，加入过期列表
                 slot.Remove(elem)
                 pc.wheelMu.Lock()
                 pc.wheelElem = nil
+                pc.wheelList = nil
                 pc.wheelMu.Unlock()
                 expired = append(expired, pc)
             } else {
+                // 期间有活动，重新放入未来槽位
                 slot.Remove(elem)
                 requeue = append(requeue, pc)
             }
             elem = next
         }
 
+        // 重新注册活跃连接
         for _, pc := range requeue {
             newSlot := tw.targetSlotLocked(pc.idleTimeout)
-            newElem := tw.slots[newSlot].PushBack(pc)
+            newList := tw.slots[newSlot]
+            newElem := newList.PushBack(pc)
             pc.wheelMu.Lock()
             pc.wheelElem = newElem
+            pc.wheelList = newList
             pc.wheelMu.Unlock()
         }
         tw.mu.Unlock()
 
+        // 锁外执行关闭和日志，不阻塞时间轮
         for _, pc := range expired {
             if pc.enableLog && pc.logFile != "" {
                 lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
@@ -396,11 +410,13 @@ func (l *asyncLogger) send(path, msg string) {
     select {
     case l.ch <- logEntry{path, msg}:
     default:
+        // 队列满时静默丢弃，不阻塞业务
     }
 }
 
 func (l *asyncLogger) run() {
     handles := make(map[string]*os.File)
+    // 每5分钟关闭重开，兼容 logrotate
     cleanupTicker := time.NewTicker(5 * time.Minute)
     defer cleanupTicker.Stop()
     defer func() {
@@ -485,5 +501,7 @@ var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
+
+
 
 
