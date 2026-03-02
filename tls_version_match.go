@@ -527,4 +527,3 @@ var (
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
 
-
