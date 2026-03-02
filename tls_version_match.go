@@ -69,24 +69,51 @@ func (m *TLSVersionMatcher) Validate() error {
             m.Version,
         )
     }
+    connIdle := time.Duration(m.ConnIdleTimeout)
+    if connIdle > 0 {
+        maxCapacity := time.Duration(wheelSlots-1) * time.Second
+        if connIdle > maxCapacity {
+            return fmt.Errorf(
+                "tls_version: conn_idle_timeout (%s) exceeds wheel capacity (%s)",
+                connIdle, maxCapacity,
+            )
+        }
+        if connIdle < 5*time.Second {
+            return fmt.Errorf(
+                "tls_version: conn_idle_timeout (%s) too small, minimum 5s",
+                connIdle,
+            )
+        }
+    }
+    idle := time.Duration(m.IdleTimeout)
+    if idle > 0 && idle < time.Second {
+        return fmt.Errorf(
+            "tls_version: idle_timeout (%s) too small, minimum 1s",
+            idle,
+        )
+    }
     return nil
 }
 
-// ── Match 主逻辑 ──────────────────────────────────────────────────────────────
+// ── Match ─────────────────────────────────────────────────────────────────────
 
 func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     rawConn := cx.Conn
-
     timeout := defaultHandshakeTimeout
     if m.IdleTimeout != 0 {
         timeout = time.Duration(m.IdleTimeout)
     }
+
     _ = rawConn.SetReadDeadline(time.Now().Add(timeout))
     defer rawConn.SetReadDeadline(time.Time{})
 
     setTCPOptions(rawConn)
 
     br := bufio.NewReaderSize(rawConn, peekBufSize)
+
+    // 必须在 Peek 之前替换 cx.Conn
+    // bufio.Reader 一旦 Peek，数据就在缓冲区里了
+    // 必须通过同一个 br 来读，否则数据丢失
     pc := newPeekedConn(rawConn, br)
     cx.Conn = pc
 
@@ -96,17 +123,17 @@ func (m *TLSVersionMatcher) Match(cx *layer4.Connection) (bool, error) {
     }
 
     matched, err := matchVersion(data, m.Version)
-    if err != nil {
+    if err != nil || !matched {
         return false, nil
     }
 
-    if matched && m.ConnIdleTimeout > 0 {
+    if m.ConnIdleTimeout > 0 {
         pc.logFile = m.LogFile
         pc.enableLog = m.EnableLog
         globalWheel.register(pc, time.Duration(m.ConnIdleTimeout))
     }
 
-    return matched, nil
+    return true, nil
 }
 
 // ── TLS 解析 ──────────────────────────────────────────────────────────────────
@@ -159,18 +186,26 @@ func hasTLS13(data []byte) bool {
     if len(data) < 44 {
         return false
     }
-    pos := 44 + int(data[43])
+    // Session ID Length 最大 32 字节（RFC 规定）
+    sessionIDLen := int(data[43])
+    if sessionIDLen > 32 {
+        return false
+    }
+    pos := 44 + sessionIDLen
     if pos+2 > len(data) {
         return false
     }
+    // Cipher Suites
     pos += 2 + int(binary.BigEndian.Uint16(data[pos:pos+2]))
     if pos+1 > len(data) {
         return false
     }
+    // Compression Methods
     pos += 1 + int(data[pos])
     if pos+2 > len(data) {
         return false
     }
+    // Extensions
     extEnd := pos + 2 + int(binary.BigEndian.Uint16(data[pos:pos+2]))
     pos += 2
     if extEnd > len(data) {
@@ -205,16 +240,16 @@ func hasTLS13(data []byte) bool {
 
 type peekedConn struct {
     net.Conn
-    reader      io.Reader
-    total       int64         // 累计读取字节（atomic）
-    lastActive  int64         // 最后活跃时间 UnixNano（atomic）
-    wheelElem   *list.Element // 时间轮节点
-    wheelList   *list.List    // 直接保存链表引用，O(1) 删除无需知道槽位
-    wheelMu     sync.Mutex    // 保护 wheelElem / wheelList
-    idleTimeout time.Duration
-    logFile     string
-    enableLog   bool
-    closeOnce   sync.Once
+    reader        io.Reader
+    total         int64
+    lastActive    int64
+    wheelElem     *list.Element // 只在 tw.mu 下访问
+    wheelList     *list.List    // 只在 tw.mu 下访问
+    idleTimeout   time.Duration
+    remainTimeout time.Duration
+    logFile       string
+    enableLog     bool
+    closeOnce     sync.Once
 }
 
 func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
@@ -226,7 +261,6 @@ func newPeekedConn(c net.Conn, r io.Reader) *peekedConn {
     return pc
 }
 
-// Read 从 bufio 缓冲读取，更新活跃时间（无锁）
 func (c *peekedConn) Read(b []byte) (int, error) {
     n, err := c.reader.Read(b)
     if n > 0 {
@@ -236,7 +270,6 @@ func (c *peekedConn) Read(b []byte) (int, error) {
     return n, err
 }
 
-// Write 更新活跃时间（无锁）
 func (c *peekedConn) Write(b []byte) (int, error) {
     n, err := c.Conn.Write(b)
     if n > 0 {
@@ -255,8 +288,7 @@ func (c *peekedConn) Close() error {
     return err
 }
 
-// rstClose SO_LINGER(0) 强制 RST 断开
-// 不产生 TIME_WAIT / CLOSE_WAIT / FIN_WAIT_2
+// rstClose SO_LINGER(0) 强制 RST，不产生 TIME_WAIT
 func (c *peekedConn) rstClose() {
     c.closeOnce.Do(func() {
         globalWheel.remove(c)
@@ -288,10 +320,14 @@ func (tw *timerWheel) targetSlotLocked(timeout time.Duration) int {
     if ticks <= 0 {
         ticks = 1
     }
+    if ticks >= wheelSlots {
+        ticks = wheelSlots - 1
+    }
     return (tw.currentSlot + ticks) % wheelSlots
 }
 
 // register 注册连接到时间轮
+// wheelElem/wheelList 统一在 tw.mu 下操作，避免竞态和死锁
 func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     pc.idleTimeout = timeout
 
@@ -299,30 +335,22 @@ func (tw *timerWheel) register(pc *peekedConn, timeout time.Duration) {
     slot := tw.targetSlotLocked(timeout)
     l := tw.slots[slot]
     elem := l.PushBack(pc)
-    tw.mu.Unlock()
-
-    // 同时保存节点和链表引用，remove 时 O(1) 直接调用 l.Remove(elem)
-    pc.wheelMu.Lock()
     pc.wheelElem = elem
     pc.wheelList = l
-    pc.wheelMu.Unlock()
+    tw.mu.Unlock()
 }
 
 // remove 从时间轮移除连接，O(1)
+// wheelElem/wheelList 统一在 tw.mu 下操作，避免竞态和死锁
 func (tw *timerWheel) remove(pc *peekedConn) {
-    pc.wheelMu.Lock()
+    tw.mu.Lock()
     elem := pc.wheelElem
     l := pc.wheelList
     pc.wheelElem = nil
     pc.wheelList = nil
-    pc.wheelMu.Unlock()
-
-    if elem == nil || l == nil {
-        return
+    if elem != nil && l != nil {
+        l.Remove(elem)
     }
-
-    tw.mu.Lock()
-    l.Remove(elem) // O(1)：container/list 双向链表直接操作前后指针
     tw.mu.Unlock()
 }
 
@@ -342,33 +370,31 @@ func (tw *timerWheel) run() {
         for elem := slot.Front(); elem != nil; {
             next := elem.Next()
             pc := elem.Value.(*peekedConn)
-            lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
 
-            if time.Since(lastActive) >= pc.idleTimeout {
-                // 真正超时，加入过期列表
-                slot.Remove(elem)
-                pc.wheelMu.Lock()
-                pc.wheelElem = nil
-                pc.wheelList = nil
-                pc.wheelMu.Unlock()
+            lastActive := time.Unix(0, atomic.LoadInt64(&pc.lastActive))
+            idle := time.Since(lastActive)
+
+            slot.Remove(elem)
+            pc.wheelElem = nil // 已在 tw.mu 下，直接赋值
+            pc.wheelList = nil
+
+            if idle >= pc.idleTimeout {
+                // 真正超时
                 expired = append(expired, pc)
             } else {
-                // 期间有活动，重新放入未来槽位
-                slot.Remove(elem)
+                // 还有活动，用剩余时间重新入队
+                pc.remainTimeout = pc.idleTimeout - idle
                 requeue = append(requeue, pc)
             }
             elem = next
         }
 
-        // 重新注册活跃连接
         for _, pc := range requeue {
-            newSlot := tw.targetSlotLocked(pc.idleTimeout)
+            newSlot := tw.targetSlotLocked(pc.remainTimeout)
             newList := tw.slots[newSlot]
             newElem := newList.PushBack(pc)
-            pc.wheelMu.Lock()
-            pc.wheelElem = newElem
+            pc.wheelElem = newElem // 已在 tw.mu 下，直接赋值
             pc.wheelList = newList
-            pc.wheelMu.Unlock()
         }
         tw.mu.Unlock()
 
@@ -389,7 +415,7 @@ func (tw *timerWheel) run() {
     }
 }
 
-// ── 异步日志队列 ──────────────────────────────────────────────────────────────
+// ── 异步日志 ──────────────────────────────────────────────────────────────────
 
 type logEntry struct {
     path string
@@ -416,7 +442,7 @@ func (l *asyncLogger) send(path, msg string) {
 
 func (l *asyncLogger) run() {
     handles := make(map[string]*os.File)
-    // 每5分钟关闭重开，兼容 logrotate
+    // 每 5 分钟关闭重开，兼容 logrotate
     cleanupTicker := time.NewTicker(5 * time.Minute)
     defer cleanupTicker.Stop()
     defer func() {
@@ -441,7 +467,6 @@ func (l *asyncLogger) run() {
                 handles[entry.path] = f
             }
             _, _ = f.WriteString(entry.msg)
-
         case <-cleanupTicker.C:
             for k, f := range handles {
                 _ = f.Close()
@@ -501,7 +526,5 @@ var (
     _ layer4.ConnMatcher = (*TLSVersionMatcher)(nil)
     _ caddy.Validator    = (*TLSVersionMatcher)(nil)
 )
-
-
 
 
